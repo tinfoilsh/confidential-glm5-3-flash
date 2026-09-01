@@ -1,0 +1,49 @@
+# Fix K-pool tail-cache writes on hybrid (KDA + sparse-MLA kpool) models on
+# the V2 runner, e.g. GLM-5.3-Flash: long generations die with an illegal
+# memory access (or silently never write the tail pool).
+# 1. model_states/mamba_hybrid.py omits positions= in build_attn_metadata()
+#    while model_states/default.py passes it, so KpoolTailMetadataBuilder
+#    sees positions=None, skips compute_kpool_tail_slot_mapping, and the
+#    generic 1-block mapping yields garbage block ids that the unchecked
+#    tail kernels write through.
+# 2. compute_kpool_tail_slot_mapping wrote into slot_mapping.clone(); the
+#    clone's transient address is captured by CUDA graphs and faults on
+#    replay (Xid 13) once positions are passed. Write in-place into the
+#    caller's persistent buffer instead.
+#
+# Source: vllm#53906 comment by vcruz305 (2026-08-30, root cause +
+# reproducer), confirmed same day by drakosha (SM90, MTP k=3, CUDA graphs
+# on). Related: vllm#54317. The comment carried no diff; the change is
+# reconstructed minimally from its prose. Retire when it lands on the
+# glm-release branch or upstream.
+--- a/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
++++ b/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
+@@ -281,6 +281,10 @@
+             kv_cache_config=kv_cache_config,
+             seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
+             dcp_local_seq_lens=input_batch.dcp_local_seq_lens,
++            # tinfoil: forward positions like default.py does, else
++            # KpoolTailMetadataBuilder skips the circular tail slot mapping
++            # and the tail kernels write out of bounds (vllm#53906).
++            positions=input_batch.positions,
+             model_specific_attn_metadata=mamba_attn_metadata,
+             for_cudagraph_capture=for_capture,
+             rswa_prefix_lens=input_batch.prompt_lens,
+--- a/usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/indexer.py
++++ b/usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/indexer.py
+@@ -548,11 +548,11 @@
+     ``slot = own_block * kpool + pos % kpool`` instead, which is the layout
+     the tail kernels and ``KpoolTailManager`` are designed around.
+ 
+-    Pure torch (no Triton, no device sync): the indexer op consumes the tail
+-    slot mapping on its eager break, so the returned tensor need not be the
+-    persistent ``BlockTables`` buffer.
++    Pure torch (no Triton, no device sync). Writes in-place into the caller's
++    persistent slot-mapping buffer: a clone's transient address would be
++    captured by CUDA graphs and fault on replay (vllm#53906).
+     """
+-    out = slot_mapping.clone()
++    out = slot_mapping
+     if num_actual_tokens == 0:
+         return out
+     device = slot_mapping.device

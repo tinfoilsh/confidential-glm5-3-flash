@@ -1,0 +1,130 @@
+# Reject grammar-invalid draft tokens in the V2 (worker/gpu) runner. The
+# scheduler marks grammar-rejected drafts with -1 sentinels
+# (scheduler_output.num_invalid_spec_tokens), but the V2 runner takes drafts
+# from req_states.draft_tokens on the GPU and never sees the sentinels, so
+# the rejection sampler can accept grammar-illegal drafts and the structured
+# output manager AssertionErrors the engine (vllm#46118, vllm#49694). Mirror
+# the V1 runner: scatter the sentinels into the batch, keep a pre-clamp
+# gather for the rejection sampler, downgrade the assert to a warning.
+#
+# Carried from confidential-glm5-2-b200 (vLLM v0.27.0); rebased onto
+# ZJY0516/vllm@933876c (glm-release, vllm#53906; image
+# vllm/vllm-openai:glm53-flash): line offsets regenerated, and InputBatch
+# gained a max_query_len kwarg/field — our draft_sampled_raw kwarg/field now
+# sits after it. Retire when fixed upstream.
+--- a/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/model_runner.py
++++ b/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/model_runner.py
+@@ -1230,6 +1230,12 @@
+         # Get the number of draft tokens for each request.
+         draft_tokens = scheduler_output.scheduled_spec_decode_tokens
+         num_draft_tokens_per_req = None
++        # tinfoil: grammar-invalid drafts arrive as -1 sentinels in
++        # scheduled_spec_decode_tokens, but req_states.draft_tokens still holds
++        # the raw speculator output, so the rejection sampler never sees them
++        # and can accept grammar-illegal drafts (vllm#46118, vllm#49694). The
++        # V1 runner scatters the sentinels into its input batch; mirror that.
++        has_invalid_drafts = False
+         if not draft_tokens:
+             # No draft token scheduled (common case).
+             total_num_draft_tokens = 0
+@@ -1248,6 +1254,28 @@
+                 dtype=np.int32,
+                 count=num_reqs,
+             )
++            invalid_spec = scheduler_output.num_invalid_spec_tokens
++            if invalid_spec and any(invalid_spec.values()):
++                rows: list[int] = []
++                cols: list[int] = []
++                vals: list[int] = []
++                for req_id, num_invalid in invalid_spec.items():
++                    if not num_invalid:
++                        continue
++                    state_idx = self.req_states.req_id_to_index.get(req_id)
++                    spec_tokens = draft_tokens.get(req_id)
++                    if state_idx is None or not spec_tokens:
++                        continue
++                    for j, tok in enumerate(spec_tokens):
++                        rows.append(state_idx)
++                        cols.append(j)
++                        vals.append(tok)
++                if rows:
++                    has_invalid_drafts = True
++                    self.req_states.draft_tokens[
++                        torch.tensor(rows, dtype=torch.long, device=self.device),
++                        torch.tensor(cols, dtype=torch.long, device=self.device),
++                    ] = torch.tensor(vals, dtype=torch.int64, device=self.device)
+             num_bonus_tokens = self.model_state.num_new_sampled_tokens_per_step
+             total_num_draft_tokens = int(num_draft_tokens_per_req.sum())
+             total_num_logits = num_reqs * num_bonus_tokens + total_num_draft_tokens
+@@ -1345,6 +1373,13 @@
+             total_num_logits,
+             self.model_state.num_new_sampled_tokens_per_step,
+         )
++        # tinfoil: keep the -1 sentinels for the rejection sampler (gathered
++        # before clamping), then clamp so the embedding never sees a negative
++        # token id. Mirrors the V1 runner's clamp of its input ids.
++        draft_sampled_raw = None
++        if has_invalid_drafts:
++            draft_sampled_raw = self.input_buffers.input_ids[logits_indices]
++            self.input_buffers.input_ids[:num_tokens_after_padding].clamp_(min=0)
+ 
+         # CPU upper bound on seq_lens; padded entries left at zero.
+         num_computed_tokens_np = self.req_states.num_computed_tokens_np[idx_mapping_np]
+@@ -1403,6 +1438,7 @@
+                 if adaptive_verification is not None
+                 else None
+             ),
++            draft_sampled_raw=draft_sampled_raw,
+         )
+         return pcp.maybe_partition_pcp_batch(self.pcp_manager, input_batch)
+ 
+--- a/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/input_batch.py
++++ b/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/input_batch.py
+@@ -111,6 +111,10 @@
+     # a query length this batch's own split does not reach, so attention metadata
+     # stays valid for every replay the graph serves.
+     max_query_len: int | None = None
++
++    # tinfoil: [total_num_logits] input token per logit row with -1 kept for
++    # grammar-invalid drafts; None unless such sentinels are present this step.
++    draft_sampled_raw: torch.Tensor | None = None
+ 
+     @classmethod
+     def make_dummy(
+--- a/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
++++ b/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
+@@ -256,7 +256,11 @@
+         # that num_nans is computed before applying penalties and temperature.
+         num_nans = get_num_nans(logits) if self.sampler.compute_nans else None
+ 
+-        draft_sampled = input_batch.input_ids[input_batch.logits_indices]
++        # tinfoil: prefer the pre-clamp gather that keeps -1 sentinels for
++        # grammar-invalid drafts; the verify kernels reject draft ids < 0.
++        draft_sampled = input_batch.draft_sampled_raw
++        if draft_sampled is None:
++            draft_sampled = input_batch.input_ids[input_batch.logits_indices]
+         pos = input_batch.positions[input_batch.logits_indices]
+ 
+         max_num_logprobs = self.sampler.sampling_states.max_num_logprobs(
+--- a/usr/local/lib/python3.12/dist-packages/vllm/v1/structured_output/__init__.py
++++ b/usr/local/lib/python3.12/dist-packages/vllm/v1/structured_output/__init__.py
+@@ -333,9 +333,17 @@
+                         if accepted:
+                             state_advancements += 1
+                         elif not post_reasoning_end_in_window:
+-                            raise AssertionError(
+-                                (token, req_id, scheduled_spec_decode_tokens)
++                            # tinfoil: a draft the grammar rejects predates the
++                            # bitmask; treat the rest of the window as
++                            # don't-care like the -1 sentinel case instead of
++                            # killing the engine (vllm#46118).
++                            logger.warning(
++                                "Grammar rejected draft token %d for request "
++                                "%s; leaving rest of spec window unconstrained.",
++                                token,
++                                req_id,
+                             )
++                            apply_bitmask = False
+                     cumulative_index += 1
+                 # Diffusion LLMs don't sample a bonus token after the
+                 # scheduled positions, so skip its bitmask in that case.

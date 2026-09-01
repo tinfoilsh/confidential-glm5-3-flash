@@ -1,0 +1,29 @@
+--- a/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/buffer_utils.py
++++ b/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/buffer_utils.py
+@@ -48,6 +48,8 @@
+         self.cpu = torch.zeros(size, dtype=dtype, device="cpu", pin_memory=True)
+         self.np = self.cpu.numpy()
+         self.uva = get_accelerator_view_from_cpu_tensor(self.cpu)
++        # tinfoil: device mirror — GPU reads of host-mapped memory are unsafe under TDX CC
++        self.dev = torch.zeros(size, dtype=dtype, device=torch.device("cuda"))
+ 
+ 
+ class UvaBufferPool:
+@@ -76,7 +78,8 @@
+         dst = buf.cpu if isinstance(x, torch.Tensor) else buf.np
+         n = len(x)
+         dst[:n] = x
+-        return buf.uva[:n]
++        buf.dev[:n].copy_(buf.cpu[:n], non_blocking=True)
++        return buf.dev[:n]
+ 
+     def copy_to_gpu(
+         self,
+@@ -122,6 +125,7 @@
+     ):
+         if max_concurrency is None:
+             max_concurrency = _DEFAULT_MAX_CONCURRENCY
++        uva_instead_of_gpu = False  # tinfoil: host-resident UVA tensors unsafe under TDX CC
+         supported_dtypes = [torch.int32, torch.int64, torch.float32]
+         if dtype not in supported_dtypes:
+             raise ValueError(
