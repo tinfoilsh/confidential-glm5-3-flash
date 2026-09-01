@@ -6,7 +6,7 @@ gpus: 1
 models:
   - name: "glm-5-3-flash"
     repo: "RedHatAI/GLM-5.3-Flash-NVFP4@36c184c6cda000a481711306df5adde42f63321a"
-    mpk: "b09abf2d6d088cbe5515ba110a36f02f526de0e95db752730dc1f4f5a4f97717_197881163776_f21029cd-3ef4-5893-9fa5-46933aae8a34"
+    mpk: "bb9acee3efcdc5e6cdbbe936a16955896a42687b9bbb7ed04ae5ba0fce1523eb_197881163776_f21029cd-3ef4-5893-9fa5-46933aae8a34"
 
 containers:
   - name: "glm-5-3-flash"
@@ -26,7 +26,7 @@ containers:
     command:
       [
         "--model",
-        "/tinfoil/mpk/mpk-b09abf2d6d088cbe5515ba110a36f02f526de0e95db752730dc1f4f5a4f97717",
+        "/tinfoil/mpk/mpk-bb9acee3efcdc5e6cdbbe936a16955896a42687b9bbb7ed04ae5ba0fce1523eb",
         "--kv-cache-dtype",
         "fp8",
         "--tensor-parallel-size",
