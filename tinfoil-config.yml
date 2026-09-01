@@ -10,7 +10,7 @@ models:
 
 containers:
   - name: "glm-5-3-flash"
-    image: "ghcr.io/tinfoilsh/confidential-glm5-3-flash@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    image: "ghcr.io/tinfoilsh/confidential-glm5-3-flash@sha256:d77aca07eaf191d4c5b3d92c1e3f7882990c71dbda75d5180589dd8f09b26c75" # v0.0.1
     runtime: nvidia
     gpus: all
     restart: always
