@@ -1,7 +1,7 @@
-cvm-version: 0.12.0
-cpus: 32
-memory: 524288
-gpus: 8
+cvm-version: 0.10.8
+cpus: 16
+memory: 65536
+gpus: 1
 
 models:
   - name: "glm-5-3-flash"
@@ -30,7 +30,7 @@ containers:
         "--kv-cache-dtype",
         "fp8",
         "--tensor-parallel-size",
-        "8",
+        "1",
         "--tool-call-parser",
         "glm47",
         "--enable-auto-tool-choice",
@@ -49,9 +49,9 @@ containers:
         "--compilation-config",
         '{"pass_config":{"fuse_allreduce_rms":false}}',
         "--max-model-len",
-        "1048576",
+        "131072",
         "--max-num-seqs",
-        "32",
+        "8",
         "--speculative-config",
         '{"method":"mtp","num_speculative_tokens":5}',
       ]
