@@ -56,7 +56,7 @@ containers:
         '{"method":"mtp","num_speculative_tokens":5}',
       ]
     tmpfs:
-      /tmp: size=512m,mode=1777,exec
+      /tmp: size=16g,mode=1777,exec
       /root: size=20g,mode=0700,exec
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:8001/health"]
