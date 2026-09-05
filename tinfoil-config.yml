@@ -54,6 +54,13 @@ containers:
         "32",
         "--speculative-config",
         '{"method":"mtp","num_speculative_tokens":5}',
+        # RedHatAI/GLM-5.3-Flash-NVFP4 ships a generation_config.json with
+        # temperature 1.0 but no top_p (upstream zai-org has top_p 0.95), so
+        # vLLM defaulted to top_p 1.0. With NVFP4 that samples stray
+        # Chinese/Cyrillic/Arabic/Greek tokens into Italian and English output
+        # (~8 per 10k tokens in long-document runs; 0 with top_p 0.95).
+        "--override-generation-config",
+        '{"top_p":0.95}',
       ]
     tmpfs:
       /tmp: size=16g,mode=1777,exec
