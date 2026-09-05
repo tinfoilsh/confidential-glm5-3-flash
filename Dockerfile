@@ -3,6 +3,9 @@
 # Patched vLLM image for GLM-5.3-Flash NVFP4. Base is the dedicated
 # upstream GLM-5.3-Flash tag, digest-pinned for attestation.
 ARG VLLM_BASE_IMAGE=vllm/vllm-openai:glm53-flash@sha256:2c6da6c6f16ed15c91e412d896dba13701f25fe1861eaec9ddaa4db34d1d21c4
+ARG SIDECAR_IMAGE=ghcr.io/tinfoilsh/inference-sidecar@sha256:65ce23d6560c46a1e8614ede187fcbf9798b267aa33878905b4872404787f47d
+FROM ${SIDECAR_IMAGE} AS sidecar
+
 FROM ${VLLM_BASE_IMAGE}
 
 # Patches are -p1 unified diffs rooted at /; they target
@@ -41,3 +44,6 @@ RUN set -eux; \
         fi; \
     done; \
     python3 -c "import flashinfer; print('flashinfer', flashinfer.__version__, 'cubins baked')"
+
+COPY --from=sidecar /inference-sidecar /opt/tinfoil/inference-sidecar
+ENTRYPOINT ["/opt/tinfoil/inference-sidecar", "vllm", "serve"]
