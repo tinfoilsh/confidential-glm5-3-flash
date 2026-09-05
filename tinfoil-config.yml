@@ -34,6 +34,7 @@ containers:
         "--tool-call-parser",
         "glm47",
         "--enable-auto-tool-choice",
+        "--enable-force-include-usage",
         "--enable-prompt-tokens-details",
         "--reasoning-parser",
         "glm45",
