@@ -38,6 +38,9 @@ containers:
         "--enable-prompt-tokens-details",
         "--reasoning-parser",
         "glm45",
+        # Keeps content:null tool-call turns from rendering a literal "None"
+        # into the GLM template, which drives repetition loops (vllm#54337).
+        "--chat-template-content-format=string",
         "--served-model-name",
         "glm-5-3-flash",
         "--scheduling-policy",
@@ -60,8 +63,10 @@ containers:
         # vLLM defaulted to top_p 1.0. With NVFP4 that samples stray
         # Chinese/Cyrillic/Arabic/Greek tokens into Italian and English output
         # (~8 per 10k tokens in long-document runs; 0 with top_p 0.95).
+        # max_new_tokens is the fallback max_tokens for requests that omit one
+        # (explicit values win); without it they can run to the 1M context.
         "--override-generation-config",
-        '{"top_p":0.95}',
+        '{"top_p":0.95,"max_new_tokens":131072}',
       ]
     tmpfs:
       /tmp: size=16g,mode=1777,exec

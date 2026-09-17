@@ -15,3 +15,10 @@ Deviations:
   from a verified model pack.
 - FlashInfer cubins baked at build time (the container runs offline).
 - Patches in `patches/`, one line each in the header of the patch file.
+- Runaway-generation guards (GLM-5.3-Flash can loop in long tool-calling
+  sessions, vllm#54337): `--chat-template-content-format=string`, a
+  `max_new_tokens` fallback of 131072 for requests that omit `max_tokens`,
+  and `patches/0003`, which arms vLLM's built-in repetition detector for
+  requests that do not set `repetition_detection`. Tune the detector with
+  the container env `TINFOIL_REPETITION_DETECTION="max,min,count"` (`"0"`
+  disables); tripped requests finish with `finish_reason=repetition`.

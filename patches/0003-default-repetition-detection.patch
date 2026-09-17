@@ -1,0 +1,64 @@
+# Arm vLLM's built-in repetition detector (SamplingParams.repetition_detection)
+# for requests that do not set one. GLM-5.3-Flash can degrade into repetition
+# loops in long tool-calling sessions (vllm#54337) and a looping request holds
+# a --max-num-seqs slot until max_tokens or the context limit. Default: a
+# >=4-token pattern repeated 16x, patterns up to 64 tokens. Container env
+# TINFOIL_REPETITION_DETECTION="max,min,count" overrides; "0" disables.
+--- a/usr/local/lib/python3.12/dist-packages/vllm/sampling_params.py
++++ b/usr/local/lib/python3.12/dist-packages/vllm/sampling_params.py
+@@ -5,9 +5,10 @@
+ import copy
+ import json as json_mod
+ import math
++import os
+ from dataclasses import field
+ from enum import Enum, IntEnum
+-from functools import cached_property
++from functools import cached_property, lru_cache
+ from typing import Annotated, Any
+ 
+ import msgspec
+@@ -195,6 +196,30 @@
+             )
+ 
+ 
++# tinfoil: default repetition detection. Override with
++# TINFOIL_REPETITION_DETECTION="max_pattern,min_pattern,min_count"; "0" disables.
++_TINFOIL_REPETITION_DETECTION_DEFAULT = "64,4,16"
++
++
++@lru_cache(maxsize=1)
++def _tinfoil_repetition_detection_default() -> RepetitionDetectionParams | None:
++    raw = os.environ.get(
++        "TINFOIL_REPETITION_DETECTION", _TINFOIL_REPETITION_DETECTION_DEFAULT
++    ).strip()
++    if raw in ("", "0", "off"):
++        return None
++    try:
++        max_pattern, min_pattern, min_count = (int(v) for v in raw.split(","))
++        return RepetitionDetectionParams(
++            max_pattern_size=max_pattern,
++            min_pattern_size=min_pattern,
++            min_count=min_count,
++        )
++    except (ValueError, VLLMValidationError) as exc:
++        logger.warning("Ignoring invalid TINFOIL_REPETITION_DETECTION=%r: %s", raw, exc)
++        return None
++
++
+ class RequestOutputKind(Enum):
+     # Return entire output so far in every RequestOutput
+     CUMULATIVE = 0
+@@ -536,6 +561,12 @@
+         # eos_token_id is added to this by the engine
+         self._all_stop_token_ids.update(self.stop_token_ids)
+ 
++        # tinfoil: arm repetition detection unless the caller set it.
++        if self.repetition_detection is None and not self.trace_decode_token_ids:
++            default = _tinfoil_repetition_detection_default()
++            if default is not None:
++                self.repetition_detection = copy.copy(default)
++
+         if self.skip_reading_prefix_cache is None:
+             # If prefix caching is enabled,
+             # the output of prompt logprobs may less than n_prompt_tokens,
