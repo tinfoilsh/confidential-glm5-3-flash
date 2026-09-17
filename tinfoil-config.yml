@@ -50,7 +50,7 @@ containers:
         "--compilation-config",
         '{"pass_config":{"fuse_allreduce_rms":false}}',
         "--max-model-len",
-        "1048576",
+        "393216",
         "--max-num-seqs",
         "32",
         "--speculative-config",
