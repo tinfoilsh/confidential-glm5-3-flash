@@ -20,6 +20,9 @@
 # v0.29.0 branch point. Do not "upgrade" this to a 0.29.x tag expecting a
 # newer vLLM -- released 0.29.x cannot load GLM-5.3-Flash at all.
 ARG VLLM_BASE_IMAGE=vllm/vllm-openai:glm53-flash@sha256:819ec9c063412e5730d1b0e82046ba540d1bf991f3c4f661a849aae8a0c52374
+ARG SIDECAR_IMAGE=ghcr.io/tinfoilsh/inference-sidecar@sha256:65ce23d6560c46a1e8614ede187fcbf9798b267aa33878905b4872404787f47d
+FROM ${SIDECAR_IMAGE} AS sidecar
+
 FROM ${VLLM_BASE_IMAGE}
 
 # Patches are -p1 unified diffs rooted at /; they target
@@ -58,3 +61,6 @@ RUN set -eux; \
         fi; \
     done; \
     python3 -c "import flashinfer; print('flashinfer', flashinfer.__version__, 'cubins baked')"
+
+COPY --from=sidecar /inference-sidecar /opt/tinfoil/inference-sidecar
+ENTRYPOINT ["/opt/tinfoil/inference-sidecar", "vllm", "serve"]
