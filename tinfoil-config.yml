@@ -5,8 +5,9 @@ gpus: 8
 
 models:
   - name: "glm-5-3-flash"
-    repo: "RedHatAI/GLM-5.3-Flash-NVFP4@36c184c6cda000a481711306df5adde42f63321a"
-    mpk: "bb9acee3efcdc5e6cdbbe936a16955896a42687b9bbb7ed04ae5ba0fce1523eb_197881163776_f21029cd-3ef4-5893-9fa5-46933aae8a34"
+    repo: "RedHatAI/GLM-5.3-Flash-NVFP4@240131d6a447c8d89acd428c5ddfc85598651744"
+    mpk: "e846c8dd82fca17e72c841ae739ae913b6c4c276feab082f1dd9f1f7f39f1472_197881163776_b94b6898-045a-59de-b1cc-571c56d2a940"
+    schema: 2
 
 containers:
   - name: "glm-5-3-flash"
@@ -26,7 +27,7 @@ containers:
     command:
       [
         "--model",
-        "/tinfoil/mpk/mpk-bb9acee3efcdc5e6cdbbe936a16955896a42687b9bbb7ed04ae5ba0fce1523eb",
+        "/tinfoil/mpk/mpk-e846c8dd82fca17e72c841ae739ae913b6c4c276feab082f1dd9f1f7f39f1472",
         "--kv-cache-dtype",
         "fp8",
         "--tensor-parallel-size",
@@ -38,6 +39,9 @@ containers:
         "--enable-prompt-tokens-details",
         "--reasoning-parser",
         "glm45",
+        # Keeps content:null tool-call turns from rendering a literal "None"
+        # into the GLM template, which drives repetition loops (vllm#54337).
+        "--chat-template-content-format=string",
         "--served-model-name",
         "glm-5-3-flash",
         "--scheduling-policy",
@@ -60,8 +64,10 @@ containers:
         # vLLM defaulted to top_p 1.0. With NVFP4 that samples stray
         # Chinese/Cyrillic/Arabic/Greek tokens into Italian and English output
         # (~8 per 10k tokens in long-document runs; 0 with top_p 0.95).
+        # max_new_tokens is the fallback max_tokens for requests that omit one
+        # (explicit values win); without it they can run to the 1M context.
         "--override-generation-config",
-        '{"top_p":0.95}',
+        '{"top_p":0.95,"max_new_tokens":131072}',
       ]
     tmpfs:
       /tmp: size=16g,mode=1777,exec

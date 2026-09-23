@@ -7,14 +7,16 @@
 # the V1 runner: scatter the sentinels into the batch, keep a pre-clamp
 # gather for the rejection sampler, downgrade the assert to a warning.
 #
-# Carried from confidential-glm5-2-b200 (vLLM v0.27.0); rebased onto
-# ZJY0516/vllm@933876c (glm-release, vllm#53906; image
-# vllm/vllm-openai:glm53-flash): line offsets regenerated, and InputBatch
-# gained a max_query_len kwarg/field — our draft_sampled_raw kwarg/field now
-# sits after it. Retire when fixed upstream.
+# Carried from confidential-glm5-2-b200 (vLLM v0.27.0), then rebased onto
+# ZJY0516/vllm@933876c (glm-release), and now onto upstream main @385dce36
+# (post-v0.29.0, #53906 merged; image vllm/vllm-openai:glm53-flash): line
+# offsets regenerated, and prepare_inputs() now passes the batch to
+# pcp.maybe_partition_pcp_batch() with padded_num_tokens=, which moved the
+# tail of the InputBatch(...) call that our draft_sampled_raw kwarg anchors
+# to. Both upstream issues are still open. Retire when fixed upstream.
 --- a/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/model_runner.py
 +++ b/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/model_runner.py
-@@ -1230,6 +1230,12 @@
+@@ -1224,6 +1224,12 @@
          # Get the number of draft tokens for each request.
          draft_tokens = scheduler_output.scheduled_spec_decode_tokens
          num_draft_tokens_per_req = None
@@ -27,7 +29,7 @@
          if not draft_tokens:
              # No draft token scheduled (common case).
              total_num_draft_tokens = 0
-@@ -1248,6 +1254,28 @@
+@@ -1242,6 +1248,28 @@
                  dtype=np.int32,
                  count=num_reqs,
              )
@@ -56,7 +58,7 @@
              num_bonus_tokens = self.model_state.num_new_sampled_tokens_per_step
              total_num_draft_tokens = int(num_draft_tokens_per_req.sum())
              total_num_logits = num_reqs * num_bonus_tokens + total_num_draft_tokens
-@@ -1345,6 +1373,13 @@
+@@ -1343,6 +1371,13 @@
              total_num_logits,
              self.model_state.num_new_sampled_tokens_per_step,
          )
@@ -70,30 +72,30 @@
  
          # CPU upper bound on seq_lens; padded entries left at zero.
          num_computed_tokens_np = self.req_states.num_computed_tokens_np[idx_mapping_np]
-@@ -1403,6 +1438,7 @@
+@@ -1395,6 +1430,7 @@
                  if adaptive_verification is not None
                  else None
              ),
 +            draft_sampled_raw=draft_sampled_raw,
          )
-         return pcp.maybe_partition_pcp_batch(self.pcp_manager, input_batch)
- 
+         return pcp.maybe_partition_pcp_batch(
+             self.pcp_manager,
 --- a/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/input_batch.py
 +++ b/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/input_batch.py
-@@ -111,6 +111,10 @@
-     # a query length this batch's own split does not reach, so attention metadata
+@@ -109,6 +109,10 @@
      # stays valid for every replay the graph serves.
      max_query_len: int | None = None
-+
+ 
 +    # tinfoil: [total_num_logits] input token per logit row with -1 kept for
 +    # grammar-invalid drafts; None unless such sentinels are present this step.
 +    draft_sampled_raw: torch.Tensor | None = None
- 
++
      @classmethod
      def make_dummy(
+         cls,
 --- a/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
 +++ b/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
-@@ -256,7 +256,11 @@
+@@ -267,7 +267,11 @@
          # that num_nans is computed before applying penalties and temperature.
          num_nans = get_num_nans(logits) if self.sampler.compute_nans else None
  
@@ -108,7 +110,7 @@
          max_num_logprobs = self.sampler.sampling_states.max_num_logprobs(
 --- a/usr/local/lib/python3.12/dist-packages/vllm/v1/structured_output/__init__.py
 +++ b/usr/local/lib/python3.12/dist-packages/vllm/v1/structured_output/__init__.py
-@@ -333,9 +333,17 @@
+@@ -339,9 +339,17 @@
                          if accepted:
                              state_advancements += 1
                          elif not post_reasoning_end_in_window:
