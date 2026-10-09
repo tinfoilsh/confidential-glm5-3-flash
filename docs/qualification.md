@@ -24,8 +24,9 @@ Release workflows are manually dispatched and are not needed to review this PR.
 The packaged image passes read-only startup on B300 with CC enabled and no debug
 extensions. All 64 native CUDA test executions across eight GPUs and 17 serving
 checks pass. Uncached recall passes at 32,763 and 1,047,273 prompt tokens.
-Cancellation, matched performance, customer-stream latency, and production
-attestation remain separate qualification gates.
+A separate 22-request transfer corpus passes cancellation after token progress,
+recovery, optional outputs, and sampling transitions. Matched performance,
+customer-stream latency, and production attestation remain separate gates.
 
 The CPU policy tests execute the actual patched function and class bodies with
 CPU boundaries for CUDA operations. They cover ownership, reused request rows,
