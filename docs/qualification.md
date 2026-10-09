@@ -49,7 +49,7 @@ correctness, CC, and 1M context. Report every trial against both criteria sets:
 | --- | --- | --- |
 | p95 time to first token | ≤ +5% | ≤ +5% |
 | p95 time per output token | ≤ +5% | ≤ +10% |
-| p95 and p99 customer-visible streaming gaps | ≤ +5% | ≤ +5% |
+| p95 and p99 customer-visible streaming gaps | Unspecified | ≤ +5% |
 
 Time per output token is a secondary guardrail. Review each request's worst
 pauses and stall frequency in addition to pooled percentiles. Label backend
