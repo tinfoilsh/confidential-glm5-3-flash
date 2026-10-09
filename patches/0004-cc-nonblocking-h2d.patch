@@ -1,0 +1,17 @@
+--- a/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/buffer_utils.py
++++ b/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/buffer_utils.py
+@@ -55,8 +55,12 @@
+ 
+     def uva(self, n: int | None = None) -> torch.Tensor:
+         if n is None:
+-            return self._uva.copy_(self.cpu)
+-        return self._uva[:n].copy_(self.cpu[:n])
++            return self._uva.copy_(
++                self.cpu, non_blocking=envs.VLLM_TINFOIL_CC_OPTIMIZATIONS
++            )
++        return self._uva[:n].copy_(
++            self.cpu[:n], non_blocking=envs.VLLM_TINFOIL_CC_OPTIMIZATIONS
++        )
+ 
+ 
+ class UvaBufferPool:

@@ -1,0 +1,314 @@
+--- /dev/null
++++ b/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/cc_readback.py
+@@ -0,0 +1,242 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Consumer-thread readback for the supported confidential Flash configuration."""
++
++from contextvars import ContextVar
++from threading import RLock, current_thread
++
++import torch
++
++from vllm.v1.outputs import ModelRunnerOutput
++from vllm.v1.worker.gpu.async_utils import AsyncOutput, async_copy_to_np
++from vllm.v1.worker.gpu.sample.output import SamplerOutput
++
++_TENSOR_PARALLEL_SIZE = 8
++_SINGLE_PARTITION = 1
++_SPECULATIVE_DEPTH = 5
++_BONUS_TOKENS = 1
++_TOKEN_DIMENSIONS = 2
++_COUNT_DIMENSIONS = 1
++_BATCH_AXIS = 0
++_TOKEN_AXIS = 1
++_MAX_CONTEXT = 1_048_576
++_MAX_REQUESTS = 32
++_MODEL_NAME = "glm-5-3-flash"
++_SAMPLE_METHOD = "sample_tokens"
++
++
++def _supported_config(worker) -> bool:
++    from vllm.v1.worker.gpu.model_runner import GPUModelRunner
++    from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
++    from vllm.v1.worker.gpu.sample.sampler import Sampler
++    from vllm.v1.worker.gpu.spec_decode.mtp.speculator import MTPSpeculator
++    from vllm.v1.worker.gpu.spec_decode.multi_module_mtp.speculator import (
++        MultiModuleMTPSpeculator,
++    )
++    from vllm.v1.worker.gpu.spec_decode.rejection_sampler import RejectionSampler
++
++    runner = worker.model_runner
++    parallel = worker.parallel_config
++    spec = runner.speculative_config
++    return (
++        type(worker.rank) is int
++        and 0 <= worker.rank < _TENSOR_PARALLEL_SIZE
++        and type(runner) is GPUModelRunner
++        and parallel.tensor_parallel_size == _TENSOR_PARALLEL_SIZE
++        and all(
++            getattr(parallel, field) == _SINGLE_PARTITION
++            for field in (
++                "data_parallel_size",
++                "pipeline_parallel_size",
++                "prefill_context_parallel_size",
++                "decode_context_parallel_size",
++            )
++        )
++        and not parallel.enable_expert_parallel
++        and runner.scheduler_config.async_scheduling is True
++        and runner.max_model_len == _MAX_CONTEXT
++        and runner.max_num_reqs == _MAX_REQUESTS
++        and runner.model_config.served_model_name == _MODEL_NAME
++        and worker.device.type == "cuda"
++        and worker.device == runner.device
++        and spec is not None
++        and spec.method == "mtp"
++        and spec.num_speculative_tokens == _SPECULATIVE_DEPTH
++        and spec.num_speculative_tokens_per_batch_size is None
++        and not spec.enable_adaptive_verification
++        and spec.rejection_sample_method == "standard"
++        and runner.num_speculative_steps == _SPECULATIVE_DEPTH
++        and type(runner.sampler) is Sampler
++        and type(runner.rejection_sampler) is RejectionSampler
++        and runner.rejection_sampler.sampler is runner.sampler
++        and type(runner.speculator) in (MTPSpeculator, MultiModuleMTPSpeculator)
++        and runner.speculator.acceptance_estimator is None
++        and not runner.speculator.supports_mm_inputs
++        and type(runner.model_state) is MambaHybridModelState
++        and runner.model_state.recoverssm is None
++    )
++
++
++class _DeferredOutput(AsyncOutput):
++    def __init__(
++        self,
++        model_runner_output,
++        sampler_output,
++        num_sampled_tokens,
++        main_stream,
++        copy_stream,
++        consumer,
++        policy,
++    ):
++        # Retain both GPU sources until the consumer completes its copies.
++        self.model_runner_output = model_runner_output
++        self.sampler_output = sampler_output
++        self.num_sampled_tokens = num_sampled_tokens
++        self.pending_aux_output = None
++        self.logprobs_tensors = None
++        self.num_nans = None
++        self.sampling_mask_tensors = None
++        self.prompt_logprobs_dict = {}
++        self.prompt_token_id_logprobs_dict = {}
++        self._has_fault = None
++        self.copy_event = torch.cuda.Event(blocking=True)
++        self.producer_event = torch.cuda.Event()
++        self.producer_event.record(main_stream)
++        self.copy_stream = copy_stream
++        self.consumer = consumer
++        self.policy = policy
++        self.attempted = False
++        self.failed = None
++        with policy.state_lock:
++            policy.pending.add(self)
++
++    def get_output(self):
++        if current_thread() is not self.consumer:
++            raise ValueError("Deferred output reached a different consumer thread")
++        if self.failed is not None:
++            raise self.failed
++        if not self.attempted:
++            self.attempted = True
++            try:
++                with (
++                    self.policy.submissions,
++                    torch.inference_mode(),
++                    torch.cuda.stream(self.copy_stream),
++                ):
++                    self.copy_stream.wait_event(self.producer_event)
++                    self.sampled_token_ids = async_copy_to_np(
++                        self.sampler_output.sampled_token_ids
++                    )
++                    self.num_sampled_tokens_np = async_copy_to_np(
++                        self.num_sampled_tokens
++                    )
++                    self.copy_event.record(self.copy_stream)
++                result = super().get_output()
++            except BaseException as error:
++                with self.policy.state_lock:
++                    self.failed = error
++                raise
++            else:
++                with self.policy.state_lock:
++                    self.policy.pending.remove(self)
++                return result
++        return super().get_output()
++
++
++class CCReadbackPolicy:
++    def __init__(self, runner):
++        self.runner = runner
++        self.context = ContextVar("cc_readback_selection", default=None)
++        self.submissions = RLock()
++        self.state_lock = RLock()
++        self.pending = set()
++
++    def select(self, process, request):
++        method, _, _, output_rank = request
++        worker = process.worker.worker
++        with self.state_lock:
++            failed = any(output.failed is not None for output in self.pending)
++        eligible = (
++            worker.model_runner is self.runner
++            and method == _SAMPLE_METHOD
++            and type(output_rank) is int
++            and 0 <= output_rank < _TENSOR_PARALLEL_SIZE
++            and process.rank == worker.rank
++            and process.use_async_scheduling is True
++            and not failed
++            and _supported_config(worker)
++        )
++        selection = None
++        if eligible:
++            consumer = process.async_output_copy_thread
++            if consumer.is_alive():
++                selection = (process.rank == output_rank, consumer)
++        return self.context.set(selection)
++
++    def reset(self, token):
++        self.context.reset(token)
++
++    def make_output(
++        self,
++        model_runner_output,
++        sampler_output,
++        num_sampled_tokens,
++        main_stream,
++        copy_stream,
++        check_ep_fault,
++        pending_aux_output,
++    ):
++        optional_output = (
++            check_ep_fault
++            or pending_aux_output is not None
++            or sampler_output.logprobs_tensors is not None
++            or sampler_output.num_nans is not None
++            or sampler_output.sampling_mask_tensors is not None
++            or bool(model_runner_output.prompt_logprobs_dict)
++            or bool(model_runner_output.prompt_token_id_logprobs_dict)
++        )
++        selection = self.context.get()
++        if selection is not None and not optional_output:
++            is_reply, consumer = selection
++            if not is_reply:
++                return model_runner_output
++            sampled = sampler_output.sampled_token_ids
++            ordinary = (
++                is_reply
++                and type(model_runner_output) is ModelRunnerOutput
++                and type(sampler_output) is SamplerOutput
++                and type(sampled) is torch.Tensor
++                and type(num_sampled_tokens) is torch.Tensor
++                and sampled.device == self.runner.device == num_sampled_tokens.device
++                and sampled.dtype == torch.int64
++                and num_sampled_tokens.dtype == torch.int32
++                and sampled.ndim == _TOKEN_DIMENSIONS
++                and sampled.shape[_TOKEN_AXIS] == _SPECULATIVE_DEPTH + _BONUS_TOKENS
++                and num_sampled_tokens.ndim == _COUNT_DIMENSIONS
++                and sampled.shape[_BATCH_AXIS]
++                == num_sampled_tokens.shape[_BATCH_AXIS]
++                == len(model_runner_output.req_ids)
++                and num_sampled_tokens is sampler_output.num_sampled
++                and main_stream is self.runner.main_stream
++                and copy_stream is self.runner.output_copy_stream
++            )
++            if ordinary:
++                return _DeferredOutput(
++                    model_runner_output,
++                    sampler_output,
++                    num_sampled_tokens,
++                    main_stream,
++                    copy_stream,
++                    consumer,
++                    self,
++                )
++        with self.submissions:
++            return AsyncOutput(
++                model_runner_output=model_runner_output,
++                sampler_output=sampler_output,
++                num_sampled_tokens=num_sampled_tokens,
++                main_stream=main_stream,
++                copy_stream=copy_stream,
++                check_ep_fault=check_ep_fault,
++                pending_aux_output=pending_aux_output,
++            )
+--- a/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/model_runner.py
++++ b/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/model_runner.py
+@@ -96,6 +96,7 @@
+ )
+ from vllm.v1.worker.gpu.block_table import BlockTables
+ from vllm.v1.worker.gpu.buffer_utils import set_default_max_concurrency
++from vllm.v1.worker.gpu.cc_readback import CCReadbackPolicy
+ from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
+ from vllm.v1.worker.gpu.cudagraph_utils import (
+     BatchExecutionDescriptor,
+@@ -341,6 +342,9 @@
+ 
+         # For transferring state from execute_model to subsequent sample_tokens call.
+         self.execute_model_state: ExecuteModelState | None = None
++        self.cc_readback = (
++            CCReadbackPolicy(self) if envs.VLLM_TINFOIL_CC_OPTIMIZATIONS else None
++        )
+ 
+         # Expert parallelism load balancer.
+         self.eplb = EPLBController(self.parallel_config, self.device)
+@@ -2139,8 +2143,11 @@
+         if self.aux_output_connector is not None:
+             pending_aux_output = self.aux_output_connector.prepare_output(input_batch)
+ 
+-        # Start async output copy here so that it can overlap with speculator proposal.
+-        async_output = AsyncOutput(
++        # Establish the output producer boundary before speculator proposal.
++        make_output = (
++            self.cc_readback.make_output if self.cc_readback is not None else AsyncOutput
++        )
++        async_output = make_output(
+             model_runner_output=model_runner_output,
+             sampler_output=sampler_output,
+             num_sampled_tokens=num_sampled,
+@@ -2169,10 +2176,8 @@
+             )
+ 
+         # Postprocess results and update request states.
+-        # NOTE: This is intentionally done after creating the AsyncOutput,
+-        # ensuring that `copy_event` is recorded before calling postprocess.
+-        # This sequencing may slightly reduce latency as async D2H copy does not
+-        # need to wait for the postprocess to finish.
++        # The output producer boundary precedes postprocess, so readback does
++        # not need to wait for postprocess or the speculative proposal to finish.
+         self.postprocess_sampled(
+             input_batch.idx_mapping,
+             sampler_output.sampled_token_ids,
+--- a/usr/local/lib/python3.12/dist-packages/vllm/v1/executor/multiproc_executor.py
++++ b/usr/local/lib/python3.12/dist-packages/vllm/v1/executor/multiproc_executor.py
+@@ -1041,6 +1041,9 @@
+     ) -> None:
+         """Execute one RPC in a separate frame from the dequeue loop."""
+         method, args, kwargs, output_rank = rpc_request
++        runner = getattr(self.worker.worker, "model_runner", None)
++        readback = getattr(runner, "cc_readback", None)
++        token = readback.select(self, rpc_request) if readback is not None else None
+         try:
+             if isinstance(method, str):
+                 func = getattr(self.worker, method)
+@@ -1060,6 +1063,9 @@
+             # containing its string representation before transport.
+             if output_rank is None or self.rank == output_rank:
+                 self.handle_output(e)
++        finally:
++            if readback is not None:
++                readback.reset(token)
+ 
+     @staticmethod
+     def setup_proc_title_and_log_prefix(enable_ep: bool) -> None:

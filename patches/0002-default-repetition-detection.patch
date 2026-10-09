@@ -1,9 +1,3 @@
-# Arm vLLM's built-in repetition detector (SamplingParams.repetition_detection)
-# for requests that do not set one. GLM-5.3-Flash can degrade into repetition
-# loops in long tool-calling sessions (vllm#54337) and a looping request holds
-# a --max-num-seqs slot until max_tokens or the context limit. Default: a
-# >=4-token pattern repeated 16x, patterns up to 64 tokens. Container env
-# TINFOIL_REPETITION_DETECTION="max,min,count" overrides; "0" disables.
 --- a/usr/local/lib/python3.12/dist-packages/vllm/sampling_params.py
 +++ b/usr/local/lib/python3.12/dist-packages/vllm/sampling_params.py
 @@ -5,9 +5,10 @@
@@ -18,10 +12,12 @@
  from typing import Annotated, Any
  
  import msgspec
-@@ -195,6 +196,30 @@
+@@ -189,6 +190,30 @@
+                 "in engine output. If you do not wish to detect repetitive "
+                 "patterns, set max_pattern_size to 0."
              )
- 
- 
++
++
 +# tinfoil: default repetition detection. Override with
 +# TINFOIL_REPETITION_DETECTION="max_pattern,min_pattern,min_count"; "0" disables.
 +_TINFOIL_REPETITION_DETECTION_DEFAULT = "64,4,16"
@@ -44,12 +40,10 @@
 +    except (ValueError, VLLMValidationError) as exc:
 +        logger.warning("Ignoring invalid TINFOIL_REPETITION_DETECTION=%r: %s", raw, exc)
 +        return None
-+
-+
+ 
+ 
  class RequestOutputKind(Enum):
-     # Return entire output so far in every RequestOutput
-     CUMULATIVE = 0
-@@ -536,6 +561,12 @@
+@@ -556,6 +581,12 @@
          # eos_token_id is added to this by the engine
          self._all_stop_token_ids.update(self.stop_token_ids)
  

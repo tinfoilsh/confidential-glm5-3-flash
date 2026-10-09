@@ -1,0 +1,14 @@
+{
+  "flashinfer_source_files": {
+    "artifacts.py": "51e7949fb6d98d5548e76143e422dbe3092f0112835c4736e28b250ccaa84fab",
+    "jit/cubin_loader.py": "4635b9a83658c0bdff3f1b94bce4b0d84ba4e2e20ed01ee5c0e05d56a1c15b5d",
+    "jit/env.py": "9e1a52ff4ad23ab72ab2989826ce48a3b4d266c7fae60c68b6e89d9d2663ee18",
+    "jit/gemm/core.py": "e8e6685bff71a205c75a2dcefd66550244f3c342495a82414648a300a14eea5f",
+    "jit/fused_moe.py": "597122cb30d711a591979ecbaf4dbca736c631e938c033fa782a4b85fb5f37bb",
+    "jit/moe_utils.py": "9e12969820c7e2284ce5646144a43aac24feed94302b9398c50b2a0189ad4a4d",
+    "compilation_context.py": "65d3afe9c069f9d685a9f99a15e307f02d966a7112681e2d1d5ca70c054336cd",
+    "utils.py": "23c676230039e972f32343741398990002340bf1cb85b5981f2212328cba628e",
+    "attention/cute_dsl/fmha.py": "a633502b3841376b6e97279d8f94affb8dfd48e83531a6ad38289d6e17c55adc",
+    "attention/cute_dsl/fmha_blockscaled.py": "b03124f89300d81ca83ad7c67a3f56bf5d1075d48455aa6c5b707bb7d2e264cd"
+  }
+}
