@@ -1,6 +1,6 @@
 # confidential-glm5-3-flash
 
-GLM-5.3-Flash NVFP4 on eight NVIDIA B300 GPUs with confidential computing,
+GLM-5.3-Flash NVFP4 on four NVIDIA B300 GPUs with confidential computing,
 1,048,576-token context, and static five-token MTP. Weights remain pinned to
 `RedHatAI/GLM-5.3-Flash-NVFP4@240131d6` in the verified model pack.
 
@@ -9,6 +9,10 @@ CVM 0.14.13. The [patch inventory](patches/README.md) describes explicit UVA
 fallback, reduced metadata transfers, and deferred reply readback. Set
 `VLLM_TINFOIL_CC_OPTIMIZATIONS=0` to disable the transfer optimizations while
 retaining the required `VLLM_DISABLE_UVA=1` fallback.
+
+One deployment uses TP4 with 56 CPUs and 768 GiB RAM. The TP8-only reply-readback
+and text-input-staging patches retain native handling at TP4; their guards are
+unchanged.
 
 FlashInfer cubins are checksum-verified and baked for offline B300 startup.
 Generated code and locks use writable, executable caches. The existing

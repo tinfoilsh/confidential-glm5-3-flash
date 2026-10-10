@@ -4,6 +4,12 @@ and sampling-metadata mirrors, and private text-input staging. Static MTP uses
 five speculative tokens; the long-prefill threshold stays zero. Dynamic MTP
 and unmeasured metadata-omission changes are outside this candidate.
 
+The deployment selects four GPUs, TP4, 56 CPUs, and 768 GiB RAM for one model
+replica. Sampling refresh, nonblocking H2D, and metadata mirrors remain enabled.
+Patches 0005 and 0007 require TP8 and use native reply readback and text-input
+handling at TP4. Widening those guards requires separate native, serving, and
+context qualification before any performance comparison.
+
 The source port removes the experiment's live-hook machinery. It and the new
 FlashInfer read-only routing repair require qualification as a new image.
 Historical backend-chunk timings do not establish customer-facing streaming
@@ -22,8 +28,9 @@ hashes. Its artifact report is `/opt/tinfoil/flashinfer-artifacts-report.json`.
 Release workflows are manually dispatched and are not needed to review this PR.
 
 The packaged image passes read-only startup on B300 with CC enabled and no debug
-extensions. All 64 native CUDA test executions across eight GPUs and 17 serving
-checks pass. Uncached recall passes at 32,763 and 1,047,273 prompt tokens.
+extensions. Its TP8 qualification passed all 64 native CUDA test executions
+across eight GPUs and 17 serving checks. Uncached recall passes at 32,763 and
+1,047,273 prompt tokens.
 A separate 22-request transfer corpus passes cancellation after token progress,
 recovery, optional outputs, and sampling transitions. Matched performance,
 customer-stream latency, and production attestation remain separate gates.

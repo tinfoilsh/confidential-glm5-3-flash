@@ -1,7 +1,7 @@
 cvm-version: 0.14.13
-cpus: 32
-memory: 524288
-gpus: 8
+cpus: 56
+memory: 786432
+gpus: 4
 
 models:
   - name: "glm-5-3-flash"
@@ -42,7 +42,7 @@ containers:
         "--kv-cache-dtype",
         "fp8",
         "--tensor-parallel-size",
-        "8",
+        "4",
         "--tool-call-parser",
         "glm47",
         "--enable-auto-tool-choice",
