@@ -1,24 +1,32 @@
 # confidential-glm5-3-flash
 
-vLLM image for GLM-5.3-Flash (NVFP4) on 8x NVIDIA Blackwell.
+GLM-5.3-Flash NVFP4 on four NVIDIA B300 GPUs with confidential computing,
+1,048,576-token context, and static five-token MTP. Weights remain pinned to
+`RedHatAI/GLM-5.3-Flash-NVFP4@240131d6` in the verified model pack.
 
-Follows the [upstream vLLM recipe](https://recipes.vllm.ai/zai-org/GLM-5.3-Flash)
-(nvfp4 variant). The recipe asks for vLLM 0.29.0 *and* a nightly: the v0.29.0
-release branch predates GLM-5.3-Flash support (vllm#53906), so the base is
-upstream main just after v0.29.0.
+This candidate uses digest-pinned vLLM 0.31.0 with the V2 model runner and
+CVM 0.14.13. The [patch inventory](patches/README.md) describes explicit UVA
+fallback, reduced metadata transfers, and deferred reply readback. Set
+`VLLM_TINFOIL_CC_OPTIMIZATIONS=0` to disable the transfer optimizations while
+retaining the required `VLLM_DISABLE_UVA=1` fallback.
 
-Deviations:
+One deployment uses TP4 with 56 CPUs and 768 GiB RAM. Reply readback and
+text-input staging admit TP4 and TP8 within the guarded static-MTP configuration.
+The TP4 extension still requires native GPU and serving qualification.
 
-- Base image digest-pinned for reproducible, attestable builds. The
-  `glm53-flash` tag is mutable and has already changed lineage once.
-- Weights pinned to `RedHatAI/GLM-5.3-Flash-NVFP4@240131d6` and served
-  from a verified model pack.
-- FlashInfer cubins baked at build time (the container runs offline).
-- Patches in `patches/`, one line each in the header of the patch file.
-- Runaway-generation guards (GLM-5.3-Flash can loop in long tool-calling
-  sessions, vllm#54337): `--chat-template-content-format=string`, a
-  `max_new_tokens` fallback of 131072 for requests that omit `max_tokens`,
-  and `patches/0003`, which arms vLLM's built-in repetition detector for
-  requests that do not set `repetition_detection`. Tune the detector with
-  the container env `TINFOIL_REPETITION_DETECTION="max,min,count"` (`"0"`
-  disables); tripped requests finish with `finish_reason=repetition`.
+FlashInfer cubins are checksum-verified and baked for offline B300 startup.
+Generated code and locks use writable, executable caches. The existing
+inference sidecar, authentication, model pack, parsers, and generation defaults
+remain in the serving configuration.
+
+Runaway-generation guards use `--chat-template-content-format=string`, a
+131072-token fallback for requests that omit `max_tokens`, and the built-in
+repetition detector. Set `TINFOIL_REPETITION_DETECTION="max,min,count"` to tune
+its default `64,4,16`, or `"0"` to disable it. Requests can override the detector;
+tripped requests finish with `finish_reason=repetition`.
+
+The source-patched image is a candidate for qualification. Its policies were
+measured using live worker patches; those measurements do not validate this new
+image. Read-only GPU startup, correctness and 1M-context checks, and repeated
+matched performance runs through the customer-facing stream remain required
+before promotion. See [validation and release criteria](docs/qualification.md).
