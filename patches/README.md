@@ -14,6 +14,7 @@ worker debug extension is needed.
 | 0006 | Reuse unchanged block-count and five sampling-metadata device views, with private CPU snapshots and invalidation on partial uploads or failures. |
 | 0007 | Use private pageable staging for three text-input arrays in the supported static-MTP configuration; preserve native handling elsewhere. |
 | 0008 | Place FlashInfer routing-header links and locks in the writable generated-code directory. |
+| 0009 | Decode each distinct logprob token once per call, preserving token order and context-dependent UTF-8 correction. |
 
 Patches 0003–0007 are enabled by `VLLM_TINFOIL_CC_OPTIMIZATIONS=1`. Reply
 readback retains native handling for optional outputs and unsupported serving
