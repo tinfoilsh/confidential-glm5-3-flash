@@ -10,7 +10,7 @@
 +
 +from vllm.utils.torch_utils import PIN_MEMORY, async_tensor_h2d
 +
-+_TENSOR_PARALLEL_SIZE = 8
++_SUPPORTED_TENSOR_PARALLEL_SIZES = (4, 8)
 +_SINGLE_PARTITION = 1
 +_SPECULATIVE_DEPTH = 5
 +_MAX_CONTEXT = 1_048_576
@@ -57,7 +57,7 @@
 +        and not runner.use_pp
 +        and not runner.use_dcp
 +        and runner.dp_size == runner.dcp_size == _SINGLE_PARTITION
-+        and parallel.tensor_parallel_size == _TENSOR_PARALLEL_SIZE
++        and parallel.tensor_parallel_size in _SUPPORTED_TENSOR_PARALLEL_SIZES
 +        and all(
 +            getattr(parallel, field) == _SINGLE_PARTITION
 +            for field in (

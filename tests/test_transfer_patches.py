@@ -24,6 +24,9 @@ SAMPLING_FIELDS = ("temperature", "top_p", "top_k", "min_p", "seeds")
 POOL_DEPTH = 2
 REQUEST_SLOTS = 4
 VOCABULARY_SIZE = 100
+TENSOR_PARALLEL_SIZES = (4, 8)
+DEFAULT_TENSOR_PARALLEL_SIZE = 8
+UNSUPPORTED_TENSOR_PARALLEL_SIZE = 2
 WAIT_SECONDS = 5
 STOP = object()
 
@@ -235,7 +238,8 @@ class ReadbackFixture:
                                       device=self.device)
         self.policy = namespace["CCReadbackPolicy"](self.runner)
         self.runner.cc_readback = self.policy
-        worker = SimpleNamespace(rank=1, device=self.device, model_runner=self.runner)
+        worker = SimpleNamespace(rank=1, device=self.device, model_runner=self.runner,
+            parallel_config=SimpleNamespace(tensor_parallel_size=DEFAULT_TENSOR_PARALLEL_SIZE))
 
         class Status(Enum):
             SUCCESS = auto()
@@ -268,6 +272,52 @@ class ReadbackFixture:
         self.process.async_output_copy_thread = threading.Thread(
             target=consumer, name="WorkerAsyncOutputCopy", daemon=True)
         self.process.async_output_copy_thread.start()
+
+    @contextlib.contextmanager
+    def qualified_worker(self, tensor_parallel_size):
+        modules, classes = {}, {}
+        for suffix, name in (
+            ("model_runner", "GPUModelRunner"),
+            ("model_states.mamba_hybrid", "MambaHybridModelState"),
+            ("sample.sampler", "Sampler"),
+            ("spec_decode.mtp.speculator", "MTPSpeculator"),
+            ("spec_decode.multi_module_mtp.speculator", "MultiModuleMTPSpeculator"),
+            ("spec_decode.rejection_sampler", "RejectionSampler"),
+        ):
+            module = ModuleType("vllm.v1.worker.gpu." + suffix)
+            classes[name] = type(name, (), {})
+            setattr(module, name, classes[name])
+            modules[module.__name__] = module
+        runner = classes["GPUModelRunner"]()
+        runner.device = self.device
+        runner.max_model_len, runner.max_num_reqs = 1_048_576, 32
+        runner.scheduler_config = SimpleNamespace(async_scheduling=True)
+        runner.model_config = SimpleNamespace(served_model_name="glm-5-3-flash")
+        runner.speculative_config = SimpleNamespace(method="mtp", num_speculative_tokens=5,
+            num_speculative_tokens_per_batch_size=None, enable_adaptive_verification=False,
+            rejection_sample_method="standard")
+        runner.num_speculative_steps = 5
+        runner.sampler = classes["Sampler"]()
+        runner.rejection_sampler = classes["RejectionSampler"]()
+        runner.rejection_sampler.sampler = runner.sampler
+        runner.speculator = classes["MTPSpeculator"]()
+        runner.speculator.acceptance_estimator = None
+        runner.speculator.supports_mm_inputs = False
+        runner.model_state = classes["MambaHybridModelState"]()
+        runner.model_state.recoverssm = None
+        parallel = SimpleNamespace(tensor_parallel_size=tensor_parallel_size, data_parallel_size=1,
+            pipeline_parallel_size=1, prefill_context_parallel_size=1,
+            decode_context_parallel_size=1, enable_expert_parallel=False)
+        worker = SimpleNamespace(model_runner=runner, parallel_config=parallel,
+                                 rank=1, device=self.device)
+        runner.main_stream, runner.output_copy_stream = self.main, self.copy
+        runner.cc_readback = self.policy
+        self.runner = self.policy.runner = runner
+        self.process.worker.worker = worker
+        with patch.dict(sys.modules, modules), patch.dict(
+            self.namespace, {"_supported_config": self.guard}
+        ):
+            yield worker
 
     def arguments(self, values=None, counts=None):
         values = [[1, 2, 3, 4, 5, 6], [7, 8, 9, 10, 11, 12]] if values is None else values
@@ -344,45 +394,11 @@ class ReadbackTests(unittest.TestCase):
 
     def test_configuration_guard_rejects_unqualified_topology_and_sampling_modes(self):
         f = self.fixture()
-        modules, classes = {}, {}
-        for suffix, name in (
-            ("model_runner", "GPUModelRunner"),
-            ("model_states.mamba_hybrid", "MambaHybridModelState"),
-            ("sample.sampler", "Sampler"),
-            ("spec_decode.mtp.speculator", "MTPSpeculator"),
-            ("spec_decode.multi_module_mtp.speculator", "MultiModuleMTPSpeculator"),
-            ("spec_decode.rejection_sampler", "RejectionSampler"),
-        ):
-            module = ModuleType("vllm.v1.worker.gpu." + suffix)
-            classes[name] = type(name, (), {})
-            setattr(module, name, classes[name])
-            modules[module.__name__] = module
-        runner = classes["GPUModelRunner"]()
-        runner.device = f.device
-        runner.max_model_len, runner.max_num_reqs = 1_048_576, 32
-        runner.scheduler_config = SimpleNamespace(async_scheduling=True)
-        runner.model_config = SimpleNamespace(served_model_name="glm-5-3-flash")
-        runner.speculative_config = SimpleNamespace(method="mtp", num_speculative_tokens=5,
-            num_speculative_tokens_per_batch_size=None, enable_adaptive_verification=False,
-            rejection_sample_method="standard")
-        runner.num_speculative_steps = 5
-        runner.sampler = classes["Sampler"]()
-        runner.rejection_sampler = classes["RejectionSampler"]()
-        runner.rejection_sampler.sampler = runner.sampler
-        runner.speculator = classes["MTPSpeculator"]()
-        runner.speculator.acceptance_estimator = None
-        runner.speculator.supports_mm_inputs = False
-        runner.model_state = classes["MambaHybridModelState"]()
-        runner.model_state.recoverssm = None
-        parallel = SimpleNamespace(tensor_parallel_size=8, data_parallel_size=1,
-            pipeline_parallel_size=1, prefill_context_parallel_size=1,
-            decode_context_parallel_size=1, enable_expert_parallel=False)
-        worker = SimpleNamespace(model_runner=runner, parallel_config=parallel,
-                                 rank=1, device=f.device)
-        with patch.dict(sys.modules, modules):
+        with f.qualified_worker(DEFAULT_TENSOR_PARALLEL_SIZE) as worker:
+            runner, parallel = worker.model_runner, worker.parallel_config
             self.assertTrue(f.guard(worker))
             for target, field, unsupported in (
-                (parallel, "tensor_parallel_size", 4),
+                (parallel, "tensor_parallel_size", UNSUPPORTED_TENSOR_PARALLEL_SIZE),
                 (parallel, "pipeline_parallel_size", 2),
                 (parallel, "enable_expert_parallel", True),
                 (runner, "max_model_len", 32768),
@@ -400,6 +416,70 @@ class ReadbackTests(unittest.TestCase):
                     setattr(target, field, unsupported)
                     self.assertFalse(f.guard(worker))
                     setattr(target, field, saved)
+
+    def test_supported_topologies_dispatch_reply_and_nonreply_ranks(self):
+        for tensor_parallel_size in TENSOR_PARALLEL_SIZES:
+            f = self.fixture()
+            with f.qualified_worker(tensor_parallel_size) as worker:
+                for rank in range(tensor_parallel_size):
+                    with self.subTest(tensor_parallel_size=tensor_parallel_size, rank=rank):
+                        f.process.rank = worker.rank = rank
+                        self.assertTrue(f.guard(worker))
+                        f.rpc(f.arguments(), output_rank=rank)
+                        self.assertIs(type(f.created[-1]), f.namespace["_DeferredOutput"])
+                        self.assertEqual(f.result()[1].sampled_token_ids, [[1, 2], []])
+                        self.assertFalse(f.policy.pending)
+                        self.assertIsNone(f.policy.context.get())
+                        operations = len(f.operations)
+                        f.rpc(f.arguments(), output_rank=(rank + 1) % tensor_parallel_size)
+                        self.assertIs(type(f.created[-1]), Output)
+                        self.assertEqual(len(f.operations), operations)
+                        self.assertTrue(f.responses.empty())
+                        self.assertIsNone(f.policy.context.get())
+
+    def test_dispatch_rejects_ranks_outside_each_supported_topology(self):
+        for tensor_parallel_size in TENSOR_PARALLEL_SIZES:
+            f = self.fixture()
+            with f.qualified_worker(tensor_parallel_size) as worker:
+                f.process.rank = 0
+                for rank in (-1, tensor_parallel_size, tensor_parallel_size + 1, True, 0.5):
+                    with self.subTest(tensor_parallel_size=tensor_parallel_size, worker_rank=rank):
+                        worker.rank = rank
+                        self.assertFalse(f.guard(worker))
+                        f.rpc(f.arguments(), output_rank=f.process.rank)
+                        self.assertIs(type(f.created[-1]), f.original)
+                        self.assertEqual(f.result()[0], f.status.SUCCESS)
+                        self.assertIsNone(f.policy.context.get())
+                worker.rank = f.process.rank
+                for output_rank in (-1, tensor_parallel_size, tensor_parallel_size + 1, None, True, 0.5, "0"):
+                    with self.subTest(tensor_parallel_size=tensor_parallel_size, output_rank=output_rank):
+                        self.assertTrue(f.guard(worker))
+                        f.rpc(f.arguments(), output_rank=output_rank)
+                        self.assertIs(type(f.created[-1]), f.original)
+                        if output_rank is None or output_rank == f.process.rank:
+                            self.assertEqual(f.result()[0], f.status.SUCCESS)
+                        self.assertTrue(f.responses.empty())
+                        self.assertIsNone(f.policy.context.get())
+
+    def test_actual_guard_keeps_consumer_fallback_and_dispatch_failure_reset(self):
+        for tensor_parallel_size in TENSOR_PARALLEL_SIZES:
+            f = self.fixture()
+            with f.qualified_worker(tensor_parallel_size) as worker:
+                with patch.object(f.process.async_output_copy_thread, "is_alive", return_value=False):
+                    f.rpc(f.arguments(), output_rank=worker.rank)
+                self.assertIs(type(f.created[-1]), f.original)
+                self.assertEqual(f.result()[0], f.status.SUCCESS)
+                self.assertIsNone(f.policy.context.get())
+
+                def failing_sample():
+                    f.policy.make_output(**f.arguments())
+                    raise RuntimeError("postprocess failure")
+
+                f.process.worker.sample_tokens = failing_sample
+                f.process._execute_worker_rpc(("sample_tokens", (), {}, worker.rank))
+                self.assertEqual(f.result(), (f.status.FAILURE, "postprocess failure"))
+                self.assertIsNone(f.policy.context.get())
+                self.assertEqual(len(f.policy.pending), 1)
 
     def test_copy_failure_retains_sources_and_forces_subsequent_native_fallback(self):
         f = self.fixture()

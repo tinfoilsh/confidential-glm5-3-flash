@@ -24,7 +24,8 @@ CPU_DEVICE = torch.device("cpu")
 MAX_CONTEXT = 1_048_576
 MAX_REQUESTS = 32
 SPECULATIVE_DEPTH = 5
-TENSOR_PARALLEL_SIZE = 8
+TENSOR_PARALLEL_SIZES = (4, 8)
+UNSUPPORTED_TENSOR_PARALLEL_SIZES = (2, 16)
 
 
 def load(relative, namespace, names=None):
@@ -150,7 +151,7 @@ class StagingTests(unittest.TestCase):
             self.assertEqual(len(self.fallback_calls), before + 1)
             torch.testing.assert_close(result, torch.tensor(data))
 
-    def test_text_guard_accepts_non_multimodal_state_without_encoder_attribute(self):
+    def test_text_guard_accepts_supported_topologies_without_encoder_attribute(self):
         modules, classes = {}, {}
         definitions = (
             ("ec_connector", ("ECConnector",)),
@@ -177,7 +178,7 @@ class StagingTests(unittest.TestCase):
         speculator.target_input_buffers = input_buffers
         speculator.input_buffers = object()
         speculator.supports_mm_inputs = False
-        parallel = SimpleNamespace(tensor_parallel_size=TENSOR_PARALLEL_SIZE,
+        parallel = SimpleNamespace(tensor_parallel_size=TENSOR_PARALLEL_SIZES[0],
             data_parallel_size=1, pipeline_parallel_size=1,
             prefill_context_parallel_size=1, decode_context_parallel_size=1,
             enable_dbo=False, use_ubatching=False, enable_batch_sharded_sampling=False,
@@ -209,15 +210,22 @@ class StagingTests(unittest.TestCase):
             patch.object(torch.cuda, "current_device", return_value=CUDA_DEVICE.index),
             patch.object(torch.cuda, "current_stream", return_value=runner.main_stream),
         ):
-            self.assertTrue(self.supports(runner, scheduler, batch, 0))
-            request.mm_features = [object()]
-            self.assertFalse(self.supports(runner, scheduler, batch, 0))
-            request.mm_features = []
-            batch.req_ids.append("request")
-            self.assertFalse(self.supports(runner, scheduler, batch, 0))
-            batch.req_ids.pop()
-            spec.num_speculative_tokens_per_batch_size = [(1, 8, 3)]
-            self.assertFalse(self.supports(runner, scheduler, batch, 0))
+            for tensor_parallel_size in TENSOR_PARALLEL_SIZES:
+                with self.subTest(tensor_parallel_size=tensor_parallel_size):
+                    parallel.tensor_parallel_size = tensor_parallel_size
+                    self.assertTrue(self.supports(runner, scheduler, batch, 0))
+                    request.mm_features = [object()]
+                    self.assertFalse(self.supports(runner, scheduler, batch, 0))
+                    request.mm_features = []
+                    batch.req_ids.append("request")
+                    self.assertFalse(self.supports(runner, scheduler, batch, 0))
+                    batch.req_ids.pop()
+                    spec.num_speculative_tokens_per_batch_size = [(1, 8, 3)]
+                    self.assertFalse(self.supports(runner, scheduler, batch, 0))
+                    spec.num_speculative_tokens_per_batch_size = None
+            for tensor_parallel_size in UNSUPPORTED_TENSOR_PARALLEL_SIZES:
+                parallel.tensor_parallel_size = tensor_parallel_size
+                self.assertFalse(self.supports(runner, scheduler, batch, 0))
 
 
 if __name__ == "__main__":

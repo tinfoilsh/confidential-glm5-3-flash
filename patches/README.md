@@ -17,9 +17,9 @@ worker debug extension is needed.
 
 Patches 0003–0007 are enabled by `VLLM_TINFOIL_CC_OPTIMIZATIONS=1`. Reply
 readback retains native handling for optional outputs and unsupported serving
-configurations. Patches 0005 and 0007 require TP8; the TP4 deployment uses their
-native fallbacks. Metadata caching never skips payload updates just because
-counts match. Input staging copies into owned CPU storage before H2D, including
+configurations. Patches 0005 and 0007 admit only TP4 and TP8; their TP4 paths
+require separate qualification. Metadata caching never skips payload updates
+just because counts match. Input staging copies into owned CPU storage before H2D, including
 the complete persistent query-start array.
 
 Patch 0008 is a packaging adaptation for the read-only root filesystem and

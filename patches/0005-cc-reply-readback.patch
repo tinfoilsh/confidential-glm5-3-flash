@@ -14,7 +14,7 @@
 +from vllm.v1.worker.gpu.async_utils import AsyncOutput, async_copy_to_np
 +from vllm.v1.worker.gpu.sample.output import SamplerOutput
 +
-+_TENSOR_PARALLEL_SIZE = 8
++_SUPPORTED_TENSOR_PARALLEL_SIZES = (4, 8)
 +_SINGLE_PARTITION = 1
 +_SPECULATIVE_DEPTH = 5
 +_BONUS_TOKENS = 1
@@ -43,9 +43,9 @@
 +    spec = runner.speculative_config
 +    return (
 +        type(worker.rank) is int
-+        and 0 <= worker.rank < _TENSOR_PARALLEL_SIZE
++        and 0 <= worker.rank < parallel.tensor_parallel_size
 +        and type(runner) is GPUModelRunner
-+        and parallel.tensor_parallel_size == _TENSOR_PARALLEL_SIZE
++        and parallel.tensor_parallel_size in _SUPPORTED_TENSOR_PARALLEL_SIZES
 +        and all(
 +            getattr(parallel, field) == _SINGLE_PARTITION
 +            for field in (
@@ -163,7 +163,7 @@
 +            worker.model_runner is self.runner
 +            and method == _SAMPLE_METHOD
 +            and type(output_rank) is int
-+            and 0 <= output_rank < _TENSOR_PARALLEL_SIZE
++            and 0 <= output_rank < worker.parallel_config.tensor_parallel_size
 +            and process.rank == worker.rank
 +            and process.use_async_scheduling is True
 +            and not failed

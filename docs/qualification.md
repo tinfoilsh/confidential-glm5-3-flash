@@ -6,9 +6,9 @@ and unmeasured metadata-omission changes are outside this candidate.
 
 The deployment selects four GPUs, TP4, 56 CPUs, and 768 GiB RAM for one model
 replica. Sampling refresh, nonblocking H2D, and metadata mirrors remain enabled.
-Patches 0005 and 0007 require TP8 and use native reply readback and text-input
-handling at TP4. Widening those guards requires separate native, serving, and
-context qualification before any performance comparison.
+Patches 0005 and 0007 admit TP4 and TP8, with worker and reply ranks bounded by
+the actual tensor-parallel size. The TP4 extension requires separate native,
+serving, and context qualification before any performance comparison.
 
 The source port removes the experiment's live-hook machinery. It and the new
 FlashInfer read-only routing repair require qualification as a new image.
@@ -39,6 +39,8 @@ The CPU policy tests execute the actual patched function and class bodies with
 CPU boundaries for CUDA operations. They cover ownership, reused request rows,
 partial updates, failed-copy retries, fallback behavior, and deferred output
 ordering. They do not establish GPU lifetime or CUDA stream correctness.
+The actual configuration guards and native RPC dispatcher are exercised at TP4
+and TP8, including invalid rank bounds and consumer/exception fallbacks.
 Use a virtual environment with NumPy and CPU PyTorch, and point it at a source
 tree containing the fully applied `vllm/` directory:
 
