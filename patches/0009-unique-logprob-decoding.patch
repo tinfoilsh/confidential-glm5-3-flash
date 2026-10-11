@@ -1,0 +1,27 @@
+--- a/usr/local/lib/python3.12/dist-packages/vllm/tokenizers/detokenizer_utils.py
++++ b/usr/local/lib/python3.12/dist-packages/vllm/tokenizers/detokenizer_utils.py
+@@ -161,13 +161,18 @@
+     if not token_ids:
+         return []
+     marker = _get_leading_space_marker(tokenizer)
++    unique_token_ids = list(dict.fromkeys(token_ids))
+     if marker is None:
+-        return [tokenizer.decode([tid]) or "" for tid in token_ids]
+-    raw_tokens = tokenizer.convert_ids_to_tokens(token_ids)
+-    return [
+-        _restore_leading_spaces(raw, tokenizer.decode([tid]) or "", marker)
+-        for tid, raw in zip(token_ids, raw_tokens)
+-    ]
++        decoded_tokens = {
++            tid: tokenizer.decode([tid]) or "" for tid in unique_token_ids
++        }
++    else:
++        raw_tokens = tokenizer.convert_ids_to_tokens(unique_token_ids)
++        decoded_tokens = {
++            tid: _restore_leading_spaces(raw, tokenizer.decode([tid]) or "", marker)
++            for tid, raw in zip(unique_token_ids, raw_tokens)
++        }
++    return [decoded_tokens[tid] for tid in token_ids]
+ 
+ 
+ # Based on

@@ -1,0 +1,105 @@
+--- a/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/buffer_utils.py
++++ b/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/buffer_utils.py
+@@ -132,6 +132,41 @@
+         # CPU-to-CPU copy
+         self.gpu = self.pool.copy_to_uva(self.np[:n] if n is not None else self.np)
+         return self.gpu
++
++
++class CpuMetadataTensor(UvaBackedTensor):
++    """Reuse a published device view while its CPU-owned metadata is unchanged."""
++
++    def __init__(
++        self,
++        size: int | Sequence[int],
++        dtype: torch.dtype,
++        max_concurrency: int | None = None,
++    ):
++        super().__init__(size, dtype, max_concurrency)
++        self._cache_unchanged = (
++            envs.VLLM_TINFOIL_CC_OPTIMIZATIONS and not is_uva_available()
++        )
++        self._last_published: np.ndarray | None = None
++
++    def copy_to_uva(self, n: int | None = None) -> torch.Tensor:
++        if not self._cache_unchanged:
++            return super().copy_to_uva(n)
++        try:
++            if (
++                n is None
++                and self._last_published is not None
++                and np.array_equal(self.np, self._last_published)
++            ):
++                return self.gpu
++            self._last_published = None
++            snapshot = self.np.copy() if n is None else None
++            result = super().copy_to_uva(n)
++            self._last_published = snapshot
++            return result
++        except BaseException:
++            self._last_published = None
++            raise
+ 
+ 
+ class StagedWriteTensor:
+--- a/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/block_table.py
++++ b/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/block_table.py
+@@ -7,9 +7,9 @@
+ from vllm.triton_utils import tl, triton
+ from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+ from vllm.v1.worker.gpu.buffer_utils import (
++    CpuMetadataTensor,
+     FusedStagedWriter,
+     StagedWriteTensor,
+-    UvaBackedTensor,
+     _load_ptr,
+ )
+ 
+@@ -63,7 +63,7 @@
+             )
+             self.block_tables.append(block_table)
+ 
+-        self.num_blocks = UvaBackedTensor(
++        self.num_blocks = CpuMetadataTensor(
+             (self.num_kv_cache_groups, self.max_num_reqs), dtype=torch.int32
+         )
+         self.fused_writer: FusedStagedWriter | None = None
+--- a/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/sample/logit_bias.py
++++ b/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/sample/logit_bias.py
+@@ -7,7 +7,7 @@
+ 
+ from vllm.sampling_params import SamplingParams
+ from vllm.triton_utils import tl, triton
+-from vllm.v1.worker.gpu.buffer_utils import StagedWriteTensor, UvaBackedTensor
++from vllm.v1.worker.gpu.buffer_utils import CpuMetadataTensor, StagedWriteTensor
+ from vllm.v1.worker.gpu.sample.logits_processor.interface import (
+     LogitsContext,
+     LogitsProcessor,
+@@ -29,12 +29,12 @@
+         device = req_states.device
+ 
+         # Allowed token IDs.
+-        self.num_allowed_token_ids = UvaBackedTensor(max_num_reqs, dtype=torch.int32)
++        self.num_allowed_token_ids = CpuMetadataTensor(max_num_reqs, dtype=torch.int32)
+         self.allowed_token_ids = StagedWriteTensor(
+             (max_num_reqs, MAX_NUM_ALLOWED_TOKEN_IDS), dtype=torch.int32, device=device
+         )
+         # Logit bias.
+-        self.num_logit_bias = UvaBackedTensor(max_num_reqs, dtype=torch.int32)
++        self.num_logit_bias = CpuMetadataTensor(max_num_reqs, dtype=torch.int32)
+         self.logit_bias_token_ids = StagedWriteTensor(
+             (max_num_reqs, MAX_NUM_LOGIT_BIAS_TOKENS), dtype=torch.int32, device=device
+         )
+@@ -44,9 +44,9 @@
+             device=device,
+         )
+         # Min tokens.
+-        self.min_lens = UvaBackedTensor(max_num_reqs, dtype=torch.int32)
+-        self.num_stop_token_ids = UvaBackedTensor(max_num_reqs, dtype=torch.int32)
+-        self.restore_when_all_masked = UvaBackedTensor(max_num_reqs, dtype=torch.int32)
++        self.min_lens = CpuMetadataTensor(max_num_reqs, dtype=torch.int32)
++        self.num_stop_token_ids = CpuMetadataTensor(max_num_reqs, dtype=torch.int32)
++        self.restore_when_all_masked = CpuMetadataTensor(max_num_reqs, dtype=torch.int32)
+         self.stop_token_ids = StagedWriteTensor(
+             (max_num_reqs, MAX_NUM_STOP_TOKEN_IDS), dtype=torch.int32, device=device
+         )

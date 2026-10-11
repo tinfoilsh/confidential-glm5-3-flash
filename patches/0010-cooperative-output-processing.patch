@@ -1,0 +1,553 @@
+--- a/usr/local/lib/python3.12/dist-packages/vllm/v1/engine/async_llm.py
++++ b/usr/local/lib/python3.12/dist-packages/vllm/v1/engine/async_llm.py
+@@ -49,7 +49,12 @@
+ from vllm.v1.engine.core_client import EngineCoreClient
+ from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
+ from vllm.v1.engine.input_processor import InputProcessor
+-from vllm.v1.engine.output_processor import OutputProcessor, RequestOutputCollector
++from vllm.v1.engine.output_dispatcher import RequestOutputDispatcher
++from vllm.v1.engine.output_processor import (
++    PROMPT_LOGPROBS_CHUNK_ENTRIES,
++    OutputProcessor,
++    RequestOutputCollector,
++)
+ from vllm.v1.engine.parallel_sampling import ParentRequest
+ from vllm.v1.executor import Executor
+ from vllm.v1.fault_tolerance.utils import FaultToleranceRequest, FaultToleranceResult
+@@ -63,6 +68,8 @@
+ from vllm.v1.metrics.stats import IterationStats
+ 
+ logger = init_logger(__name__)
++OUTPUT_PROCESSING_HEAVY_SLOTS = 1
++OUTPUT_PROCESSING_TENSOR_BUDGET_BYTES = 1024 * 1024 * 1024
+ 
+ 
+ class InputStreamError(Exception):
+@@ -810,64 +817,119 @@
+         mm_processor_cache = renderer.mm_processor_cache
+         chunk_size = envs.VLLM_V1_OUTPUT_PROC_CHUNK_SIZE
+ 
++        task_group = asyncio.TaskGroup()
++
++        def new_statistics(timestamp):
++            statistics = IterationStats()
++            statistics.iteration_timestamp = timestamp
++            return statistics
++
++        def record_statistics(engine_index, statistics):
++            if logger_ref[0]:
++                logger_ref[0].record(
++                    engine_idx=engine_index,
++                    scheduler_stats=None,
++                    iteration_stats=statistics,
++                    mm_cache_stats=None,
++                )
++
++        def observe_backlog(*values):
++            if logger_ref[0]:
++                logger_ref[0].record_output_processing(*values)
++
++        dispatcher = RequestOutputDispatcher(
++            output_processor,
++            task_group,
++            chunk_entries=PROMPT_LOGPROBS_CHUNK_ENTRIES,
++            heavy_slots=OUTPUT_PROCESSING_HEAVY_SLOTS,
++            tensor_budget_bytes=OUTPUT_PROCESSING_TENSOR_BUDGET_BYTES,
++            yield_outputs=chunk_size,
++            new_statistics=new_statistics,
++            record_statistics=record_statistics,
++            abort_engine=engine_core.abort_requests_async,
++            observe_backlog=observe_backlog,
++        )
++        self.output_dispatcher = dispatcher
++
+         async def output_handler():
+             try:
+-                while True:
+-                    # 1) Pull EngineCoreOutputs from the EngineCore.
+-                    outputs = await engine_core.get_output_async()
+-                    num_outputs = len(outputs.outputs)
+-
+-                    iteration_stats = (
+-                        IterationStats() if (log_stats and num_outputs) else None
+-                    )
+-
+-                    # Split outputs into chunks of at most
+-                    # VLLM_V1_OUTPUT_PROC_CHUNK_SIZE, so that we don't block the
+-                    # event loop for too long.
+-                    engine_core_outputs = outputs.outputs
+-                    for start in range(0, num_outputs, chunk_size):
+-                        end = start + chunk_size
+-                        outputs_slice = engine_core_outputs[start:end]
+-                        # 2) Process EngineCoreOutputs.
+-                        processed_outputs = output_processor.process_outputs(
+-                            outputs_slice, outputs.timestamp, iteration_stats
+-                        )
+-                        # NOTE: RequestOutputs are pushed to their queues.
+-                        assert not processed_outputs.request_outputs
+-
+-                        # 2b) Recover from P0/P1 cache drift: the engine flags hashes
+-                        # it couldn't find (mm_cache_miss_hashes); drop them from the
+-                        # P0 shadow so the client's retry resends the data and
+-                        # repopulates P1. Hot-path no-op (field is None otherwise).
+-                        if mm_processor_cache is not None:
+-                            for eco in outputs_slice:
+-                                if eco.mm_cache_miss_hashes:
+-                                    for mm_hash in eco.mm_cache_miss_hashes:
+-                                        mm_processor_cache.invalidate(mm_hash)
+-
+-                        # Allow other asyncio tasks to run between chunks
+-                        if end < num_outputs:
+-                            await asyncio.sleep(0)
+-
+-                        # 3) Abort any reqs that finished due to stop strings.
+-                        if processed_outputs.reqs_to_abort:
+-                            await engine_core.abort_requests_async(
+-                                processed_outputs.reqs_to_abort
++                async with task_group:
++                    try:
++                        while True:
++                            await dispatcher.wait_readable()
++                            # 1) Pull EngineCoreOutputs from the EngineCore.
++                            outputs = await engine_core.get_output_async()
++                            num_outputs = len(outputs.outputs)
++                            iteration_stats = (
++                                IterationStats() if (log_stats and num_outputs) else None
+                             )
+-
+-                    output_processor.update_scheduler_stats(outputs.scheduler_stats)
+-
+-                    # 4) Logging.
+-                    # TODO(rob): make into a coroutine and launch it in
+-                    # background thread once Prometheus overhead is non-trivial.
+-                    if logger_ref[0]:
+-                        logger_ref[0].record(
+-                            engine_idx=outputs.engine_index,
+-                            scheduler_stats=outputs.scheduler_stats,
+-                            iteration_stats=iteration_stats,
+-                            mm_cache_stats=renderer.stat_mm_cache(),
+-                        )
++                            engine_core_outputs = outputs.outputs
++                            deferred = bool(dispatcher.work) or any(
++                                dispatcher.is_heavy(output)
++                                for output in engine_core_outputs
++                            )
++
++                            # Split outputs into chunks of at most
++                            # VLLM_V1_OUTPUT_PROC_CHUNK_SIZE, so that we don't block the
++                            # event loop for too long.
++                            for start in range(0, num_outputs, chunk_size):
++                                end = start + chunk_size
++                                outputs_slice = engine_core_outputs[start:end]
++                                # 2b) Recover from P0/P1 cache drift: the engine flags hashes
++                                # it couldn't find (mm_cache_miss_hashes); drop them from the
++                                # P0 shadow so the client's retry resends the data and
++                                # repopulates P1. Hot-path no-op (field is None otherwise).
++                                if mm_processor_cache is not None:
++                                    for eco in outputs_slice:
++                                        if eco.mm_cache_miss_hashes:
++                                            for mm_hash in eco.mm_cache_miss_hashes:
++                                                mm_processor_cache.invalidate(mm_hash)
++
++                                # 2) Process EngineCoreOutputs.
++                                if deferred:
++                                    for eco in outputs_slice:
++                                        await dispatcher.submit(
++                                            eco,
++                                            outputs.engine_index,
++                                            outputs.timestamp,
++                                            iteration_stats.iteration_timestamp
++                                            if iteration_stats is not None else None,
++                                        )
++                                else:
++                                    processed_outputs = output_processor.process_outputs(
++                                        outputs_slice, outputs.timestamp, iteration_stats
++                                    )
++                                    # NOTE: RequestOutputs are pushed to their queues.
++                                    assert not processed_outputs.request_outputs
++                                    # 3) Abort any reqs that finished due to stop strings.
++                                    if processed_outputs.reqs_to_abort:
++                                        await engine_core.abort_requests_async(
++                                            processed_outputs.reqs_to_abort
++                                        )
++
++                                # Allow other asyncio tasks to run between chunks
++                                if end < num_outputs:
++                                    await asyncio.sleep(0)
++
++                            output_processor.update_scheduler_stats(outputs.scheduler_stats)
++
++                            # 4) Logging.
++                            # TODO(rob): make into a coroutine and launch it in
++                            # background thread once Prometheus overhead is non-trivial.
++                            if logger_ref[0]:
++                                logger_ref[0].record(
++                                    engine_idx=outputs.engine_index,
++                                    scheduler_stats=outputs.scheduler_stats,
++                                    iteration_stats=None if deferred else iteration_stats,
++                                    mm_cache_stats=renderer.stat_mm_cache(),
++                                )
++                            if dispatcher.work:
++                                await asyncio.sleep(0)
++                    finally:
++                        await dispatcher.close()
+             except Exception as e:
++                while isinstance(e, ExceptionGroup):
++                    e = e.exceptions[0]
+                 logger.exception("AsyncLLM output_handler failed.")
+                 output_processor.propagate_error(e)
+ 
+@@ -881,6 +943,8 @@
+             (request_id,) if isinstance(request_id, str) else as_list(request_id)
+         )
+         all_request_ids = self.output_processor.abort_requests(request_ids, internal)
++        if dispatcher := getattr(self, "output_dispatcher", None):
++            dispatcher.cancel_aborted(all_request_ids)
+         await self.engine_core.abort_requests_async(all_request_ids)
+ 
+         if self.log_requests:
+--- /dev/null
++++ b/usr/local/lib/python3.12/dist-packages/vllm/v1/engine/output_dispatcher.py
+@@ -0,0 +1,167 @@
++"""Request-ordered dispatch for cooperative API output processing."""
++
++from __future__ import annotations
++
++import asyncio
++from collections import deque
++from dataclasses import dataclass, field
++
++
++@dataclass
++class PendingOutput:
++    output: object
++    engine_index: int
++    engine_timestamp: float
++    statistics: object | None
++    tensor_bytes: int
++
++
++@dataclass
++class RequestWork:
++    queue: deque = field(default_factory=deque)
++    current: PendingOutput | None = None
++    task: asyncio.Task | None = None
++
++
++class RequestOutputDispatcher:
++    def __init__(self, processor, task_group, *, chunk_entries, heavy_slots,
++                 tensor_budget_bytes, yield_outputs, new_statistics,
++                 record_statistics, abort_engine, observe_backlog):
++        if min(chunk_entries, heavy_slots, tensor_budget_bytes, yield_outputs) <= 0:
++            raise ValueError("Dispatcher limits must be positive")
++        self.processor = processor
++        self.task_group = task_group
++        self.chunk_entries = chunk_entries
++        self.tensor_budget_bytes = tensor_budget_bytes
++        self.yield_outputs = yield_outputs
++        self.new_statistics = new_statistics
++        self.record_statistics = record_statistics
++        self.abort_engine = abort_engine
++        self.observe_backlog = observe_backlog
++        self.heavy_slot = asyncio.Semaphore(heavy_slots)
++        self.work = {}
++        self.closed = False
++        self.pending_tensor_bytes = 0
++        self.active_heavy = 0
++        self.idle = asyncio.Event()
++        self.readable = asyncio.Event()
++        self._observe()
++
++    def is_heavy(self, output):
++        tensors = output.new_prompt_logprobs_tensors
++        return (output.pooling_output is None and tensors is not None
++                and tensors.logprobs.numel() > self.chunk_entries)
++
++    @staticmethod
++    def _tensor_bytes(output):
++        size = 0
++        tensors = output.new_prompt_logprobs_tensors
++        if tensors is not None:
++            size += sum(tensor.numel() * tensor.element_size() for tensor in tensors[:3])
++        if output.prompt_token_id_logprobs is not None:
++            tensor = output.prompt_token_id_logprobs
++            size += tensor.numel() * tensor.element_size()
++        if output.new_logprobs is not None:
++            size += sum(array.nbytes for array in output.new_logprobs[:3])
++        return size
++
++    def _observe(self):
++        pending_outputs = sum(len(work.queue) + (work.current is not None) for work in self.work.values())
++        self.observe_backlog(len(self.work), pending_outputs, self.pending_tensor_bytes, self.active_heavy)
++        (self.idle.clear if self.work else self.idle.set)()
++        (self.readable.set if self.pending_tensor_bytes < self.tensor_budget_bytes else self.readable.clear)()
++
++    async def wait_readable(self):
++        await self.readable.wait()
++
++    async def wait_idle(self):
++        await self.idle.wait()
++
++    async def submit(self, output, engine_index, engine_timestamp, iteration_timestamp=None):
++        if self.closed:
++            raise RuntimeError("Output dispatcher is closed")
++        state = self.processor.request_states.get(output.request_id)
++        if state is None:
++            return
++        statistics = self.new_statistics(iteration_timestamp) if iteration_timestamp is not None else None
++        item = PendingOutput(output, engine_index, engine_timestamp, statistics, self._tensor_bytes(output))
++        work = self.work.get(state)
++        if work is None and not self.is_heavy(output):
++            result = self.processor.process_outputs([output], engine_timestamp, statistics)
++            await self._record_result(result, item)
++            return
++        if work is None:
++            work = RequestWork()
++            self.work[state] = work
++            work.task = self.task_group.create_task(self._run_request(state, work))
++            work.task.add_done_callback(lambda task: self._release_work(state, work))
++        work.queue.append(item)
++        self.pending_tensor_bytes += item.tensor_bytes
++        self._observe()
++
++    async def _record_result(self, result, item):
++        assert not result.request_outputs
++        if item.statistics is not None:
++            self.record_statistics(item.engine_index, item.statistics)
++        if result.reqs_to_abort:
++            await self.abort_engine(result.reqs_to_abort)
++
++    async def _run_request(self, state, work):
++        processed_count = 0
++        try:
++            while work.queue:
++                work.current = work.queue.popleft()
++                item = work.current
++                if self.processor.request_states.get(state.request_id) is state:
++                    if self.is_heavy(item.output):
++                        async with self.heavy_slot:
++                            if self.processor.request_states.get(state.request_id) is state:
++                                self.active_heavy += 1
++                                self._observe()
++                                try:
++                                    result = await self.processor.process_outputs_async(
++                                        [item.output], item.engine_timestamp, item.statistics)
++                                finally:
++                                    self.active_heavy -= 1
++                                    self._observe()
++                                await self._record_result(result, item)
++                    else:
++                        result = self.processor.process_outputs(
++                            [item.output], item.engine_timestamp, item.statistics)
++                        await self._record_result(result, item)
++                self.pending_tensor_bytes -= item.tensor_bytes
++                work.current = None
++                item = None
++                self._observe()
++                processed_count += 1
++                if work.queue and processed_count % self.yield_outputs == 0:
++                    await asyncio.sleep(0)
++        finally:
++            item = None
++            self._release_work(state, work)
++
++    def _release_work(self, state, work):
++        if self.work.get(state) is not work:
++            return
++        if work.current is not None:
++            self.pending_tensor_bytes -= work.current.tensor_bytes
++            work.current = None
++        while work.queue:
++            self.pending_tensor_bytes -= work.queue.popleft().tensor_bytes
++        self.work.pop(state)
++        self._observe()
++
++    def cancel_aborted(self, internal_request_ids):
++        request_ids = set(internal_request_ids)
++        for state, work in tuple(self.work.items()):
++            if state.request_id in request_ids and self.processor.request_states.get(state.request_id) is not state:
++                work.task.cancel()
++
++    async def close(self):
++        self.closed = True
++        tasks = [work.task for work in self.work.values()]
++        for task in tasks:
++            task.cancel()
++        if tasks:
++            await asyncio.gather(*tasks, return_exceptions=True)
++        assert not self.work and self.pending_tensor_bytes == 0 and self.active_heavy == 0
+--- a/usr/local/lib/python3.12/dist-packages/vllm/v1/engine/output_processor.py
++++ b/usr/local/lib/python3.12/dist-packages/vllm/v1/engine/output_processor.py
+@@ -4,12 +4,15 @@
+ import asyncio
+ from collections import defaultdict, deque
+ from collections.abc import Iterable
++from copy import copy
+ from dataclasses import dataclass
++from itertools import islice
+ from typing import TYPE_CHECKING, Any, cast
+ 
+ import numpy as np
+ import torch
+ 
++from vllm.logprobs import FlatLogprobs
+ from vllm.lora.request import LoRARequest
+ from vllm.outputs import (
+     STREAM_FINISHED,
+@@ -46,6 +49,8 @@
+ 
+ # shared empty CPU tensor used as a placeholder pooling output
+ EMPTY_CPU_TENSOR = torch.empty(0, device="cpu")
++PROMPT_LOGPROBS_CHUNK_ENTRIES = 8192
++PROMPT_LOGPROBS_CONTEXT_ROWS = 4
+ 
+ 
+ class RequestOutputCollector:
+@@ -643,6 +648,89 @@
+             # Queue the streaming update otherwise.
+             req_state.input_chunk_queue.append(update)
+ 
++    async def process_outputs_async(
++        self,
++        engine_core_outputs: list[EngineCoreOutput],
++        engine_core_timestamp: float | None = None,
++        iteration_stats: IterationStats | None = None,
++    ) -> OutputProcessorOutput:
++        if not any(
++            output.new_prompt_logprobs_tensors is not None
++            and output.new_prompt_logprobs_tensors.logprobs.numel()
++            > PROMPT_LOGPROBS_CHUNK_ENTRIES
++            for output in engine_core_outputs
++        ):
++            return self.process_outputs(
++                engine_core_outputs, engine_core_timestamp, iteration_stats
++            )
++
++        combined = OutputProcessorOutput(request_outputs=[], reqs_to_abort=[])
++        for output in engine_core_outputs:
++            tensors = output.new_prompt_logprobs_tensors
++            state = self.request_states.get(output.request_id)
++            if (
++                state is not None
++                and output.pooling_output is None
++                and tensors is not None
++                and tensors.logprobs.numel() > PROMPT_LOGPROBS_CHUNK_ENTRIES
++            ):
++                processor = state.logprobs_processor
++                assert processor is not None
++                prompt_logprobs = processor.prompt_logprobs
++                assert prompt_logprobs is not None
++                staged = copy(processor)
++                # Only the preceding four sampled tokens affect UTF-8 correction.
++                staged.prompt_logprobs = prompt_logprobs[-PROMPT_LOGPROBS_CONTEXT_ROWS:]
++                context_rows = len(staged.prompt_logprobs)
++                rows, columns = tensors.logprobs.shape
++                chunk_rows = max(1, PROMPT_LOGPROBS_CHUNK_ENTRIES // columns)
++                for start in range(0, rows, chunk_rows):
++                    end = min(start + chunk_rows, rows)
++                    staged._update_prompt_logprobs(tensors._replace(
++                        logprob_token_ids=tensors.logprob_token_ids[start:end],
++                        logprobs=tensors.logprobs[start:end],
++                        selected_token_ranks=tensors.selected_token_ranks[start:end],
++                    ))
++                    if end < rows:
++                        await asyncio.sleep(0)
++                        if self.request_states.get(output.request_id) is not state:
++                            break
++                if self.request_states.get(output.request_id) is not state:
++                    continue
++
++                # Publish only a complete result, without yielding before queueing it.
++                assert state.logprobs_processor is processor
++                assert processor.prompt_logprobs is prompt_logprobs
++                self._commit_prompt_logprobs(
++                    prompt_logprobs, staged.prompt_logprobs, context_rows
++                )
++                output = copy(output)
++                output.new_prompt_logprobs_tensors = None
++
++            processed = self.process_outputs(
++                [output], engine_core_timestamp, iteration_stats
++            )
++            combined.request_outputs.extend(processed.request_outputs)
++            combined.reqs_to_abort.extend(processed.reqs_to_abort)
++        return combined
++
++    @staticmethod
++    def _commit_prompt_logprobs(target, staged, context_rows: int) -> None:
++        if isinstance(target, FlatLogprobs):
++            assert isinstance(staged, FlatLogprobs)
++            context_entries = staged.end_indices[context_rows - 1] if context_rows else 0
++            offset = len(target.token_ids) - context_entries
++            target.start_indices.extend(
++                index + offset for index in islice(staged.start_indices, context_rows, None)
++            )
++            target.end_indices.extend(
++                index + offset for index in islice(staged.end_indices, context_rows, None)
++            )
++            for name in ("token_ids", "logprobs", "ranks", "decoded_tokens"):
++                getattr(target, name).extend(islice(getattr(staged, name), context_entries, None))
++        else:
++            target.extend(islice(staged, context_rows, None))
++
+     def process_outputs(
+         self,
+         engine_core_outputs: list[EngineCoreOutput],
+--- a/usr/local/lib/python3.12/dist-packages/vllm/v1/metrics/loggers.py
++++ b/usr/local/lib/python3.12/dist-packages/vllm/v1/metrics/loggers.py
+@@ -479,6 +479,7 @@
+ 
+         labelnames = ["model_name", "engine"]
+         model_name = vllm_config.model_config.served_model_name
++        self._init_output_processing_metrics(model_name)
+         max_model_len = vllm_config.model_config.max_model_len
+ 
+         self.per_engine_labelvalues: dict[int, list[object]] = {
+@@ -1023,6 +1024,31 @@
+             metrics_info = config_obj.metrics_info()
+             metrics_info["engine"] = str(engine_index)
+             info_gauge.labels(**metrics_info).set(1)
++
++    def _init_output_processing_metrics(self, model_name: str) -> None:
++        definitions = (
++            ("requests", "Requests with deferred API output processing."),
++            ("outputs", "Engine outputs waiting for API output processing."),
++            ("tensor_bytes", "Estimated tensor bytes retained by API output jobs."),
++            ("active", "API output jobs actively constructing prompt logprobs."),
++        )
++        self.output_processing_gauges = [
++            self._gauge_cls(
++                name="vllm:output_processing_" + name,
++                documentation=description,
++                labelnames=["model_name"],
++                multiprocess_mode="livesum",
++            ).labels(model_name)
++            for name, description in definitions
++        ]
++
++    def record_output_processing(
++        self, requests: int, outputs: int, tensor_bytes: int, active: int
++    ) -> None:
++        for gauge, value in zip(
++            self.output_processing_gauges, (requests, outputs, tensor_bytes, active)
++        ):
++            gauge.set(value)
+ 
+     def record(
+         self,
+@@ -1279,6 +1305,15 @@
+                 PrometheusStatLogger(vllm_config, self.engine_indexes)
+             )
+ 
++    def record_output_processing(
++        self, requests: int, outputs: int, tensor_bytes: int, active: int
++    ) -> None:
++        for stat_logger in self.stat_loggers:
++            if isinstance(stat_logger, PrometheusStatLogger):
++                stat_logger.record_output_processing(
++                    requests, outputs, tensor_bytes, active
++                )
++
+     def record(
+         self,
+         scheduler_stats: SchedulerStats | None,

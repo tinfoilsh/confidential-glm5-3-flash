@@ -1,7 +1,7 @@
-cvm-version: 0.14.2
-cpus: 32
-memory: 524288
-gpus: 8
+cvm-version: 0.14.13
+cpus: 56
+memory: 786432
+gpus: 4
 
 models:
   - name: "glm-5-3-flash"
@@ -21,17 +21,28 @@ containers:
       - RUNAI_STREAMER_CONCURRENCY: "8"
       - VLLM_ALLREDUCE_USE_SYMM_MEM: "0"
       - VLLM_ALLREDUCE_USE_FLASHINFER: "0"
+      - VLLM_USE_V2_MODEL_RUNNER: "1"
+      - VLLM_DISABLE_UVA: "1"
+      - VLLM_TINFOIL_CC_OPTIMIZATIONS: "1"
       - FLASHINFER_NO_DOWNLOAD: "1"
       - NUMBA_CACHE_DIR: "/root/numba-cache"
+      - XDG_CACHE_HOME: "/root/.cache"
+      - VLLM_CACHE_ROOT: "/root/.cache/vllm"
+      - TRITON_CACHE_DIR: "/root/.cache/triton"
+      - TORCHINDUCTOR_CACHE_DIR: "/root/.cache/torchinductor"
+      - TORCH_EXTENSIONS_DIR: "/root/.cache/torch_extensions"
+      - CUDA_CACHE_PATH: "/root/.cache/cuda"
+      - FLASHINFER_WORKSPACE_BASE: "/root"
       - VLLM_ENGINE_READY_TIMEOUT_S: "3600"
     command:
       [
+        "--no-enable-flashinfer-autotune",
         "--model",
         "/tinfoil/mpk/mpk-e846c8dd82fca17e72c841ae739ae913b6c4c276feab082f1dd9f1f7f39f1472",
         "--kv-cache-dtype",
         "fp8",
         "--tensor-parallel-size",
-        "8",
+        "4",
         "--tool-call-parser",
         "glm47",
         "--enable-auto-tool-choice",
@@ -57,6 +68,9 @@ containers:
         "1048576",
         "--max-num-seqs",
         "32",
+        "--long-prefill-token-threshold",
+        "0",
+        "--no-long-prefill-token-threshold-adaptive",
         "--speculative-config",
         '{"method":"mtp","num_speculative_tokens":5}',
         # RedHatAI/GLM-5.3-Flash-NVFP4 ships a generation_config.json with
