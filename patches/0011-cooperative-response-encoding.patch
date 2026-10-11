@@ -1,0 +1,200 @@
+--- a/usr/local/lib/python3.12/dist-packages/vllm/entrypoints/openai/completion/api_router.py
++++ b/usr/local/lib/python3.12/dist-packages/vllm/entrypoints/openai/completion/api_router.py
+@@ -7,6 +7,9 @@
+ from fastapi import APIRouter, Depends, FastAPI, Request
+ from fastapi.responses import JSONResponse, StreamingResponse
+ 
++from vllm.entrypoints.openai.completion.cooperative_response import (
++    completion_json_response,
++)
+ from vllm.entrypoints.openai.completion.protocol import (
+     CompletionRequest,
+     CompletionResponse,
+@@ -59,9 +62,8 @@
+             content=generator.model_dump(), status_code=generator.error.code
+         )
+     elif isinstance(generator, CompletionResponse):
+-        return JSONResponse(
+-            content=generator.model_dump(),
+-            headers=metrics_header(metrics_header_format),
++        return await completion_json_response(
++            generator, headers=metrics_header(metrics_header_format)
+         )
+ 
+     args = getattr(raw_request.app.state, "args", None)
+--- /dev/null
++++ b/usr/local/lib/python3.12/dist-packages/vllm/entrypoints/openai/completion/cooperative_response.py
+@@ -0,0 +1,173 @@
++"""Offline native JSON batch experiment for the pinned completion schema."""
++
++import asyncio
++from io import BytesIO
++import json
++from typing import Any
++
++from pydantic import TypeAdapter
++from starlette.responses import JSONResponse
++
++from vllm.entrypoints.openai.completion.protocol import (
++    CompletionResponse,
++    CompletionResponseChoice,
++)
++
++
++PROMPT_CANDIDATES_PER_BATCH = 8192
++LARGE_PROMPT_LOGPROBS_ROWS = 16_384
++JSON_CHARACTERS_PER_BATCH = 64 * 1024
++JSON_FRAGMENTS_PER_BATCH = 2048
++_PROMPT_ADAPTER = TypeAdapter(
++    CompletionResponseChoice.model_fields["prompt_logprobs"].annotation
++)
++
++
++class _PromptRows(list):
++    def __init__(self, rows):
++        self.rows = rows
++
++    def __len__(self):
++        return len(self.rows)
++
++    def batches(self):
++        start = 0
++        while start < len(self.rows):
++            end, candidates = start, 0
++            while end < len(self.rows):
++                size = max(1, len(self.rows[end])) if isinstance(self.rows[end], dict) else 1
++                if end > start and candidates + size > PROMPT_CANDIDATES_PER_BATCH:
++                    break
++                candidates += size
++                end += 1
++            batch = _PROMPT_ADAPTER.dump_python(self.rows[start:end])
++            yield batch
++            del batch
++            start = end
++
++    def __iter__(self):
++        for batch in self.batches():
++            yield from batch
++
++
++class _EncodedJSONResponse(JSONResponse):
++    def render(self, content: bytes) -> bytes:
++        return content
++
++
++def _response_graph(response: CompletionResponse) -> dict[str, Any]:
++    result = response.model_copy(update={"choices": []}).model_dump()
++    for choice in response.choices:
++        value = choice.model_copy(update={"prompt_logprobs": None}).model_dump()
++        if choice.prompt_logprobs is not None:
++            value["prompt_logprobs"] = _PromptRows(choice.prompt_logprobs)
++        result["choices"].append(value)
++    return result
++
++
++def _use_cooperative_encoding(response: CompletionResponse) -> bool:
++    if type(response) is not CompletionResponse:
++        return False
++    if response.model_extra:
++        return False
++    if response.kv_transfer_params is not None or response.ec_transfer_params is not None:
++        return False
++    prompt_rows = 0
++    for choice in response.choices:
++        if type(choice) is not CompletionResponseChoice:
++            return False
++        if choice.model_extra:
++            return False
++        if choice.prompt_logprobs is not None:
++            if type(choice.prompt_logprobs) is not list:
++                return False
++            prompt_rows += len(choice.prompt_logprobs)
++    return prompt_rows >= LARGE_PROMPT_LOGPROBS_ROWS
++
++
++def _mapping_fragments(mapping, encoder, encode_value):
++    yield "{"
++    for index, (key, value) in enumerate(mapping.items()):
++        if index:
++            yield ","
++        yield encoder.encode(key)
++        yield ":"
++        yield from encode_value(key, value, encoder)
++    yield "}"
++
++
++def _choice_value_fragments(key, value, encoder):
++    if key != "prompt_logprobs" or not isinstance(value, _PromptRows):
++        yield encoder.encode(value)
++        return
++    yield "["
++    for index, batch in enumerate(value.batches()):
++        if index:
++            yield ","
++        # Each batch is a complete JSON array with the same native encoder.
++        yield encoder.encode(batch)[1:-1]
++    yield "]"
++
++
++def _top_value_fragments(key, value, encoder):
++    if key != "choices":
++        yield encoder.encode(value)
++        return
++    yield "["
++    for index, choice in enumerate(value):
++        if index:
++            yield ","
++        yield from _mapping_fragments(choice, encoder, _choice_value_fragments)
++    yield "]"
++
++
++async def completion_json_response(
++    response: CompletionResponse, *, headers=None
++) -> JSONResponse:
++    if not _use_cooperative_encoding(response):
++        return JSONResponse(content=response.model_dump(), headers=headers)
++
++    encoder = json.JSONEncoder(
++        ensure_ascii=False, allow_nan=False, indent=None, separators=(",", ":")
++    )
++    graph = _response_graph(response)
++    fragments = []
++    characters = 0
++    has_surrogate = False
++    encoded = _mapping_fragments(graph, encoder, _top_value_fragments)
++    try:
++        with BytesIO() as output:
++            for fragment in encoded:
++                fragments.append(fragment)
++                characters += len(fragment)
++                if (characters < JSON_CHARACTERS_PER_BATCH
++                        and len(fragments) < JSON_FRAGMENTS_PER_BATCH):
++                    continue
++                text = "".join(fragments)
++                fragments.clear()
++                characters = 0
++                try:
++                    output.write(text.encode("utf-8"))
++                except UnicodeEncodeError:
++                    # A later JSON error must take precedence over UTF-8 encoding.
++                    has_surrogate = True
++                    output.write(text.encode("utf-8", "surrogatepass"))
++                await asyncio.sleep(0)
++            text = "".join(fragments)
++            fragments.clear()
++            try:
++                output.write(text.encode("utf-8"))
++            except UnicodeEncodeError:
++                has_surrogate = True
++                output.write(text.encode("utf-8", "surrogatepass"))
++            body = output.getvalue()
++            if has_surrogate:
++                body.decode("utf-8", "surrogatepass").encode("utf-8")
++            return _EncodedJSONResponse(body, headers=headers)
++    finally:
++        encoded.close()
++        # Encoder marker cycles must not retain the caller's prompt rows.
++        for choice in graph["choices"]:
++            rows = choice["prompt_logprobs"]
++            if isinstance(rows, _PromptRows):
++                rows.rows = ()

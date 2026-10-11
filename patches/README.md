@@ -15,6 +15,9 @@ worker debug extension is needed.
 | 0007 | Use private pageable staging for three text-input arrays in the supported static-MTP configuration; preserve native handling elsewhere. |
 | 0008 | Place FlashInfer routing-header links and locks in the writable generated-code directory. |
 | 0009 | Decode each distinct logprob token once per call, preserving token order and context-dependent UTF-8 correction. |
+| 0010 | Process large prompt-score outputs cooperatively while preserving per-request ordering, cancellation, and error propagation. |
+| 0011 | Convert and JSON-encode large nonstreaming completion responses in batches. |
+| 0012 | Normalize prompt scores cooperatively in the native single-prompt completion path. |
 
 Patches 0003–0007 are enabled by `VLLM_TINFOIL_CC_OPTIMIZATIONS=1`. Reply
 readback retains native handling for optional outputs and unsupported serving
@@ -26,3 +29,8 @@ the complete persistent query-start array.
 Patch 0008 is a packaging adaptation for the read-only root filesystem and
 requires GPU startup qualification. It keeps cubin storage immutable; the bake
 manifest verifies the patched FlashInfer source and its artifact checksums.
+
+Patches 0010–0012 apply independently of `VLLM_TINFOIL_CC_OPTIMIZATIONS`.
+Large prompt-score responses yield between CPU work batches so ordinary output
+can progress. Output-processing metrics track queued requests, outputs, tensor
+bytes, and active work.

@@ -1,0 +1,135 @@
+--- a/usr/local/lib/python3.12/dist-packages/vllm/entrypoints/generate/base/serving.py
++++ b/usr/local/lib/python3.12/dist-packages/vllm/entrypoints/generate/base/serving.py
+@@ -1,5 +1,6 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import asyncio
+ import json
+ import time
+ from collections.abc import Awaitable, Mapping
+@@ -45,6 +46,9 @@
+ _T = TypeVar("_T")
+ SESSION_ID_HEADER = "X-Session-ID"
+ PRIORITY_HEADER = "X-Vllm-Priority"
++PROMPT_LOGPROB_NEGATIVE_INFINITY = float("-inf")
++PROMPT_LOGPROB_FLOOR = -9999.0
++PROMPT_LOGPROB_CLAMP_ENTRIES = 8192
+ 
+ 
+ def build_per_request_timing_metrics(
+@@ -384,6 +388,26 @@
+         if logprob_dict is None:
+             continue
+         for logprob_values in logprob_dict.values():
+-            if logprob_values.logprob == float("-inf"):
+-                logprob_values.logprob = -9999.0
++            if logprob_values.logprob == PROMPT_LOGPROB_NEGATIVE_INFINITY:
++                logprob_values.logprob = PROMPT_LOGPROB_FLOOR
+     return prompt_logprobs
++
++
++async def clamp_prompt_logprobs_async(
++    prompt_logprobs: PromptLogprobs | None,
++) -> PromptLogprobs | None:
++    if prompt_logprobs is None:
++        return prompt_logprobs
++
++    pending_entries = 0
++    for logprob_dict in prompt_logprobs:
++        pending_entries += 1
++        if logprob_dict is not None:
++            for logprob_values in logprob_dict.values():
++                if logprob_values.logprob == PROMPT_LOGPROB_NEGATIVE_INFINITY:
++                    logprob_values.logprob = PROMPT_LOGPROB_FLOOR
++                pending_entries += 1
++        if pending_entries >= PROMPT_LOGPROB_CLAMP_ENTRIES:
++            pending_entries = 0
++            await asyncio.sleep(0)
++    return prompt_logprobs
+--- a/usr/local/lib/python3.12/dist-packages/vllm/entrypoints/openai/completion/serving.py
++++ b/usr/local/lib/python3.12/dist-packages/vllm/entrypoints/openai/completion/serving.py
+@@ -5,6 +5,7 @@
+ import time
+ from collections.abc import AsyncGenerator, AsyncIterator
+ from collections.abc import Sequence as GenericSequence
++from functools import partial
+ from typing import cast
+ 
+ from fastapi import Request
+@@ -19,6 +20,7 @@
+     build_per_request_timing_metrics,
+     build_spec_decoding_metrics,
+     clamp_prompt_logprobs,
++    clamp_prompt_logprobs_async,
+     format_token_id_placeholder,
+ )
+ from vllm.entrypoints.openai.completion.protocol import (
+@@ -251,7 +253,24 @@
+ 
+             final_res_batch_checked = cast(list[RequestOutput], final_res_batch)
+ 
+-            response = self.request_output_to_completion_response(
++            prompt_logprobs_clamped = (
++                len(final_res_batch_checked) == 1
++                and final_res_batch_checked[0].prompt_token_ids is not None
++                and final_res_batch_checked[0].prompt_logprobs is not None
++                and getattr(self.request_output_to_completion_response, "__func__", None)
++                is OpenAIServingCompletion.request_output_to_completion_response
++            )
++            convert_response = self.request_output_to_completion_response
++            if prompt_logprobs_clamped:
++                await clamp_prompt_logprobs_async(
++                    final_res_batch_checked[0].prompt_logprobs
++                )
++                convert_response = partial(
++                    self._request_output_to_completion_response,
++                    prompt_logprobs_clamped=True,
++                )
++
++            response = convert_response(
+                 final_res_batch_checked,
+                 request,
+                 request_id,
+@@ -508,6 +527,29 @@
+         tokenizer: TokenizerLike | None,
+         request_metadata: RequestResponseMetadata,
+     ) -> CompletionResponse:
++        return self._request_output_to_completion_response(
++            final_res_batch,
++            request,
++            request_id,
++            created_time,
++            model_name,
++            tokenizer,
++            request_metadata,
++            prompt_logprobs_clamped=False,
++        )
++
++    def _request_output_to_completion_response(
++        self,
++        final_res_batch: list[RequestOutput],
++        request: CompletionRequest,
++        request_id: str,
++        created_time: int,
++        model_name: str,
++        tokenizer: TokenizerLike | None,
++        request_metadata: RequestResponseMetadata,
++        *,
++        prompt_logprobs_clamped: bool,
++    ) -> CompletionResponse:
+         choices: list[CompletionResponseChoice] = []
+         num_prompt_tokens = 0
+         num_generated_tokens = 0
+@@ -518,7 +560,11 @@
+             last_final_res = final_res
+             prompt_token_ids = final_res.prompt_token_ids
+             assert prompt_token_ids is not None
+-            prompt_logprobs = clamp_prompt_logprobs(final_res.prompt_logprobs)
++            prompt_logprobs = (
++                final_res.prompt_logprobs
++                if prompt_logprobs_clamped
++                else clamp_prompt_logprobs(final_res.prompt_logprobs)
++            )
+             prompt_text = final_res.prompt
+ 
+             token_ids: GenericSequence[int]
